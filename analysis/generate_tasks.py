@@ -1028,6 +1028,23 @@ def solve_tasks(
     return tasks
 
 
+def _clean_nan_recursive(obj):
+    """Recursively replace NaN/Inf with None in nested structures."""
+    if isinstance(obj, dict):
+        return {k: _clean_nan_recursive(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_clean_nan_recursive(x) for x in obj]
+    if isinstance(obj, float):
+        if math.isnan(obj) or math.isinf(obj):
+            return None
+    if hasattr(obj, 'item'):  # numpy scalar
+        val = obj.item()
+        if isinstance(val, float) and (math.isnan(val) or math.isinf(val)):
+            return None
+        return val
+    return obj
+
+
 def save_results(tasks: List[Dict], output_path: str):
     """Save results to JSON file."""
     clean_tasks = []
@@ -1036,10 +1053,8 @@ def save_results(tasks: List[Dict], output_path: str):
         for k, v in task.items():
             if k == "references":
                 clean_task[k] = [dict(ref) for ref in v] if v else []
-            elif isinstance(v, float) and math.isnan(v):
-                clean_task[k] = None
             else:
-                clean_task[k] = v
+                clean_task[k] = _clean_nan_recursive(v)
         clean_tasks.append(clean_task)
 
     with open(output_path, 'w') as f:

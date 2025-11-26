@@ -485,9 +485,12 @@ def save_analysis_results(results: List[Dict], output_path: str):
         for k, v in r.items():
             if k in ["roc_curve", "pr_curve"]:
                 continue  # Skip curve data for JSON (too large)
-            if isinstance(v, (np.floating, np.integer)):
-                clean_r[k] = float(v)
-            elif isinstance(v, float) and math.isnan(v):
+            if isinstance(v, np.floating):
+                val = float(v)
+                clean_r[k] = None if math.isnan(val) or math.isinf(val) else val
+            elif isinstance(v, np.integer):
+                clean_r[k] = int(v)
+            elif isinstance(v, float) and (math.isnan(v) or math.isinf(v)):
                 clean_r[k] = None
             else:
                 clean_r[k] = v

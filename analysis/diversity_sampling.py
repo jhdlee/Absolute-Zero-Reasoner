@@ -51,6 +51,53 @@ except ImportError:
 
 
 # ==============================================================================
+# JSON SERIALIZATION HELPER
+# ==============================================================================
+
+class NaNSafeJSONEncoder(json.JSONEncoder):
+    """JSON encoder that converts NaN/Inf to null and handles numpy types."""
+
+    def default(self, obj):
+        if isinstance(obj, np.floating):
+            if np.isnan(obj) or np.isinf(obj):
+                return None
+            return float(obj)
+        if isinstance(obj, np.integer):
+            return int(obj)
+        if isinstance(obj, np.ndarray):
+            return self._clean_array(obj.tolist())
+        return str(obj)
+
+    def _clean_array(self, arr):
+        """Recursively clean NaN values from arrays."""
+        if isinstance(arr, list):
+            return [self._clean_array(x) for x in arr]
+        if isinstance(arr, float) and (math.isnan(arr) or math.isinf(arr)):
+            return None
+        return arr
+
+    def encode(self, obj):
+        return super().encode(self._clean_nan(obj))
+
+    def _clean_nan(self, obj):
+        """Recursively replace NaN/Inf with None in nested structures."""
+        if isinstance(obj, dict):
+            return {k: self._clean_nan(v) for k, v in obj.items()}
+        if isinstance(obj, list):
+            return [self._clean_nan(x) for x in obj]
+        if isinstance(obj, float):
+            if math.isnan(obj) or math.isinf(obj):
+                return None
+        if isinstance(obj, np.floating):
+            if np.isnan(obj) or np.isinf(obj):
+                return None
+            return float(obj)
+        if isinstance(obj, np.integer):
+            return int(obj)
+        return obj
+
+
+# ==============================================================================
 # SENTENCE EMBEDDING
 # ==============================================================================
 
@@ -1072,7 +1119,7 @@ def main():
             "selected_tasks": selected_tasks,
         }
         with open(args.output_path, 'w') as f:
-            json.dump(output_data, f, indent=2, default=str)
+            json.dump(output_data, f, indent=2, cls=NaNSafeJSONEncoder)
         print(f"Selected tasks saved to: {args.output_path}")
 
     print("\n" + "=" * 80)
