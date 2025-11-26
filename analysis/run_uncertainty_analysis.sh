@@ -63,6 +63,8 @@ export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0,1}
 export VLLM_ATTENTION_BACKEND=FLASH_ATTN
 # Required for tensor parallelism with vLLM
 export VLLM_WORKER_MULTIPROC_METHOD=spawn
+# Disable custom all-reduce to avoid P2P access errors on systems without NVLink
+export VLLM_DISABLE_CUSTOM_ALL_REDUCE=1
 
 # Run analysis with vLLM
 python analysis/uncertainty_analysis.py \
