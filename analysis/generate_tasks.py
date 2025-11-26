@@ -100,7 +100,7 @@ Expected output (gold answer): {gold_answer}
 Predicted output (solver's answer): {predicted_answer}
 
 Are these two outputs equivalent? Consider that:
-- Different string representations of the same value should be considered equivalent (e.g., "1" and 1, or {'a': 1} and {{'a': 1}})
+- Different string representations of the same value should be considered equivalent (e.g., "1" and 1, or {{"a": 1}} and {{"a": 1}})
 - Floating point numbers should be compared with reasonable tolerance
 - Order of elements in sets or dictionary keys may differ but values should match
 
