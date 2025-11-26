@@ -7,7 +7,7 @@ and the disagreement between ground truth (code execution) and majority vote lab
 
 Usage:
     python analysis/uncertainty_analysis.py \
-        --model_path Qwen/Qwen2.5-Coder-3B \
+        --model_path andrewzh/Absolute_Zero_Reasoner-Coder-3b \
         --seed_path data/3b_coder_seed_io.jsonl \
         --num_tasks 100 \
         --num_solver_samples 8 \
@@ -16,6 +16,10 @@ Usage:
 
 import os
 import sys
+
+# IMPORTANT: Set multiprocessing method to 'spawn' for CUDA compatibility with vLLM tensor parallelism
+# This must be set before importing vLLM or any CUDA-related modules
+os.environ.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
 import json
 import argparse
 from pathlib import Path

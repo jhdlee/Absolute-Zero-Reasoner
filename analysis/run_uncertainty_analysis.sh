@@ -61,6 +61,8 @@ mkdir -p ${OUTPUT_DIR}
 export PYTHONPATH="${PYTHONPATH}:$(pwd)"
 export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0,1}
 export VLLM_ATTENTION_BACKEND=FLASH_ATTN
+# Required for tensor parallelism with vLLM
+export VLLM_WORKER_MULTIPROC_METHOD=spawn
 
 # Run analysis with vLLM
 python analysis/uncertainty_analysis.py \
