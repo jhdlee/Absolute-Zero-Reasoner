@@ -523,16 +523,22 @@ def main():
     uq_metrics, labels_differ = extract_uq_data(tasks)
 
     n_with_uq = len(labels_differ)
+    print(f"  Tasks with UQ metrics: {n_with_uq}")
+
+    if n_with_uq == 0:
+        print("\nError: No tasks with UQ metrics found.")
+        print("  Make sure generate_tasks.py was run with --n_samples > 1 for self-consistency")
+        print("  Check that tasks have 'uncertainty_metrics' key")
+        # Debug: show first task's keys
+        if tasks:
+            print(f"\n  Debug - First task keys: {list(tasks[0].keys())}")
+        return
+
     n_differ = sum(labels_differ)
     n_match = n_with_uq - n_differ
 
-    print(f"  Tasks with UQ metrics: {n_with_uq}")
     print(f"  Labels match: {n_match} ({100*n_match/n_with_uq:.1f}%)")
     print(f"  Labels differ: {n_differ} ({100*n_differ/n_with_uq:.1f}%)")
-
-    if n_with_uq == 0:
-        print("\nError: No tasks with UQ metrics found. Run generate_tasks.py with --n_samples > 1")
-        return
 
     if n_differ == 0 or n_match == 0:
         print("\nWarning: Only one class present. AUROC analysis not possible.")

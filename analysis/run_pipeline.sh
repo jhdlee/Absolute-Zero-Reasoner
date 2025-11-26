@@ -18,6 +18,7 @@ set -e  # Exit on error
 # ==============================================================================
 
 NUM_TASKS=${NUM_TASKS:-10}
+N_SAMPLES=${N_SAMPLES:-8}  # Number of samples for UQ metrics (must be > 1)
 PROBLEM_TYPES=${PROBLEM_TYPES:-"code_i code_o"}
 TENSOR_PARALLEL=${TENSOR_PARALLEL:-1}
 SEED=${SEED:-42}
@@ -49,6 +50,10 @@ while [[ $# -gt 0 ]]; do
     case $1 in
         --num_tasks)
             NUM_TASKS="$2"
+            shift 2
+            ;;
+        --n_samples)
+            N_SAMPLES="$2"
             shift 2
             ;;
         --problem_types)
@@ -111,6 +116,7 @@ while [[ $# -gt 0 ]]; do
             echo ""
             echo "Options:"
             echo "  --num_tasks N          Number of tasks per problem type (default: 10)"
+            echo "  --n_samples N          Number of samples for UQ metrics (default: 8, must be >1)"
             echo "  --problem_types TYPES  Space-separated problem types (default: 'code_i code_o')"
             echo "  --tensor_parallel N    Tensor parallel size for VLLM (default: 1)"
             echo "  --seed N               Random seed (default: 42)"
@@ -150,6 +156,7 @@ echo ""
 echo "Configuration:"
 echo "  Output directory: $OUTPUT_DIR"
 echo "  Number of tasks: $NUM_TASKS per type"
+echo "  N samples for UQ: $N_SAMPLES"
 echo "  Problem types: $PROBLEM_TYPES"
 echo "  Selection budget: $BUDGET"
 echo "  UQ metric: $UNCERTAINTY_METRIC"
@@ -173,6 +180,7 @@ if [ "$SKIP_GENERATE" = false ]; then
 
     GENERATE_ARGS=(
         --num_tasks "$NUM_TASKS"
+        --n_samples "$N_SAMPLES"
         --problem_types $PROBLEM_TYPES
         --seed "$SEED"
         --tensor_parallel_size "$TENSOR_PARALLEL"

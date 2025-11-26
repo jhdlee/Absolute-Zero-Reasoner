@@ -30,6 +30,7 @@ import json
 import argparse
 import re
 import math
+import time
 from typing import List, Dict, Tuple, Optional
 from collections import Counter
 import numpy as np
@@ -928,7 +929,12 @@ def solve_tasks(
             n=1,
         )
 
+        # Time LLM verification
+        llm_verify_start = time.time()
         verifier_outputs = llm.generate(verifier_prompts, verifier_sampling_params)
+        llm_verify_total_time = time.time() - llm_verify_start
+
+        print(f"  LLM verification time: {llm_verify_total_time:.2f}s total, {llm_verify_total_time/len(verifier_prompts)*1000:.1f}ms per task")
 
         for out_idx, output in enumerate(verifier_outputs):
             task_idx = verifier_task_indices[out_idx]
@@ -939,6 +945,9 @@ def solve_tasks(
 
             llm_verdict = extract_llm_verdict(verifier_response)
             task["llm_label"] = llm_verdict
+
+            # Store per-task LLM verification time (amortized)
+            task["llm_verify_time_ms"] = (llm_verify_total_time / len(verifier_prompts)) * 1000
 
     # Compute verbalized confidence (optional UQ method)
     if n_samples > 1:
@@ -984,12 +993,18 @@ def solve_tasks(
 
     # Compute execution labels (ground truth)
     print("\n  Computing execution labels (ground truth)...")
+    exec_verify_total_time = 0.0
+    exec_verify_count = 0
+
     for task in solvable_tasks:
         if task.get("solver_answer") is None:
             task["execution_label"] = None
             task["execution_result"] = "no_solver_answer"
+            task["exec_verify_time_ms"] = 0.0
             continue
 
+        # Time execution verification
+        exec_start = time.time()
         exec_correct, exec_result = verify_with_execution(
             executor=executor,
             code_snippet=task["code_snippet"],
@@ -998,14 +1013,22 @@ def solve_tasks(
             problem_type=task["problem_type"],
             imports=task.get("imports", []),
         )
+        exec_time = time.time() - exec_start
 
         task["execution_label"] = exec_correct
         task["execution_result"] = exec_result
+        task["exec_verify_time_ms"] = exec_time * 1000
+
+        exec_verify_total_time += exec_time
+        exec_verify_count += 1
 
         if task.get("llm_label") is not None:
             task["labels_match"] = task["llm_label"] == task["execution_label"]
         else:
             task["labels_match"] = None
+
+    if exec_verify_count > 0:
+        print(f"  Execution verification time: {exec_verify_total_time:.2f}s total, {exec_verify_total_time/exec_verify_count*1000:.1f}ms per task")
 
     # Print results
     print("\n  --- Results ---")
@@ -1018,12 +1041,38 @@ def solve_tasks(
             print(f"    Execution label (ground truth): {task.get('execution_label')}")
             print(f"    LLM label: {task.get('llm_label')}")
             print(f"    Labels match: {task.get('labels_match')}")
+            print(f"    Timing: exec={task.get('exec_verify_time_ms', 0):.1f}ms, llm={task.get('llm_verify_time_ms', 0):.1f}ms")
 
             if task.get("uncertainty_metrics"):
                 print("    Uncertainty metrics:")
                 for metric, value in task["uncertainty_metrics"].items():
                     if value is not None and not (isinstance(value, float) and math.isnan(value)):
                         print(f"      - {metric}: {value:.4f}" if isinstance(value, float) else f"      - {metric}: {value}")
+
+    # Print timing summary
+    print("\n  --- Timing Summary ---")
+    tasks_with_timing = [t for t in solvable_tasks if t.get("exec_verify_time_ms") is not None]
+    if tasks_with_timing:
+        exec_times = [t.get("exec_verify_time_ms", 0) for t in tasks_with_timing]
+        llm_times = [t.get("llm_verify_time_ms", 0) for t in tasks_with_timing]
+
+        print("  Execution verification:")
+        print(f"    Total: {sum(exec_times):.1f}ms")
+        print(f"    Mean: {np.mean(exec_times):.1f}ms per task")
+        print(f"    Median: {np.median(exec_times):.1f}ms per task")
+        print(f"    Min/Max: {min(exec_times):.1f}ms / {max(exec_times):.1f}ms")
+
+        print("  LLM verification:")
+        print(f"    Total: {sum(llm_times):.1f}ms")
+        print(f"    Mean: {np.mean(llm_times):.1f}ms per task")
+
+        if sum(exec_times) > 0:
+            speedup = sum(llm_times) / sum(exec_times)
+            print(f"\n  LLM/Exec ratio: {speedup:.2f}x")
+            if speedup > 1:
+                print(f"    (Execution is {1/speedup:.1f}x faster than LLM)")
+            else:
+                print(f"    (LLM is {1/speedup:.1f}x faster than Execution)")
 
     return tasks
 
