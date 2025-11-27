@@ -481,7 +481,7 @@ def run_experiment(
         tensor_parallel_size=tensor_parallel_size,
         trust_remote_code=True,
     )
-    executor = PythonExecutor(timeout=10)
+    executor = PythonExecutor(timeout_length=10)
 
     # Load seed data
     seed_data = load_seed_data(CONFIG["seed_data_path"])
