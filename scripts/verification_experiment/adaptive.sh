@@ -8,9 +8,7 @@ export VLLM_ATTENTION_BACKEND=FLASH_ATTN
 export RAY_memory_monitor_refresh_ms=0
 export RAY_LOGGING_LEVEL=DEBUG
 export HYDRA_FULL_ERROR=1
-export PYTHONPATH="${PYTHONPATH}:$(pwd)/verl"
-
-OUTPUT_SEED_PATH=${OUTPUT_SEED_PATH:-data/verification_exp_seed_io.jsonl}
+export PYTHONPATH="${PYTHONPATH}:/scratch/users/hdlee/azr/verl"
 
 # Adaptive mode specific parameters
 BUDGET_FRACTION=${BUDGET_FRACTION:-0.3}  # 30% high-uncertainty tasks use execution
@@ -67,8 +65,8 @@ python -m absolute_zero_reasoner.main_azr_ppo \
     reward_fn.math_metric=math_verify \
     trainer.log_val_generations=0 \
     azr.data_selection_strategy.update_iteration=1 \
-    azr.seed_dataset=${OUTPUT_SEED_PATH} \
-    azr.output_seed_path=${OUTPUT_SEED_PATH} \
+    azr.seed_dataset=data/3b_coder_seed_io.jsonl \
+    azr.output_seed_path=data/3b_coder_seed_io.jsonl \
     azr.pretrain_pred_steps=-1 \
     azr.executor=qwq \
     azr.ast_check=True \
@@ -96,4 +94,4 @@ python -m absolute_zero_reasoner.main_azr_ppo \
     azr.data_selection_strategy.composite_function_n_min=0 \
     azr.data_selection_strategy.composite_function_n_max=0 \
     trainer.wandb_run_id=null \
-    trainer.total_epochs=30 $@
+    trainer.total_training_steps=200 $@
