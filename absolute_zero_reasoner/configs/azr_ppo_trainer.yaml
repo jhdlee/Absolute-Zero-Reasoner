@@ -488,6 +488,10 @@ azr:
     - code_f
   pred_data_mix_strategy: "max_new"  # [uniform_total, max_new, half_new, step]
   gen_data_probabilities_strategy: "uniform"  # [uniform, step]
+  # Verification mode settings
+  verification_mode: "full_execution"  # [full_execution, full_llm, adaptive]
+  verification_budget_fraction: 0.3  # For adaptive mode: fraction of high-uncertainty tasks using execution
+  n_samples_for_uq: 8  # For adaptive mode: number of samples for uncertainty quantification
   past_epoch_window: ${azr.data_selection_strategy.update_iteration}
   seed_dataset: null
   error_seed_dataset: null
