@@ -40,6 +40,7 @@ from absolute_zero_reasoner.data_construction.prompts import (
     get_code_problem_generator_prompt,
     get_code_problem_predictor_prompt,
 )
+from absolute_zero_reasoner.data_construction.process_data import instruction_following
 from absolute_zero_reasoner.rewards.code_reward import parse_code_input_output
 from absolute_zero_reasoner.utils.code_utils.python_executor import PythonExecutor
 
@@ -59,9 +60,16 @@ CONFIG = {
     "temperature": 1.0,
     "top_p": 0.95,
     "max_tokens": 8096,
-    "n_icl_examples": 2,
+    "io_n": 6,  # Number of reference snippets
     "content_max_length": 8096,
     "seed_data_path": "data/3b_coder_seed_io.jsonl",
+    # Banned keywords (from coder config)
+    "banned_keywords": [
+        "logging", "random", "multiprocessing", "pebble", "subprocess",
+        "threading", "datetime", "time", "hashlib", "hmac", "bcrypt",
+        "os.sys", "os.path", "sys.exit", "os.environ", "calendar"
+    ],
+    "banned_assertion_keywords": [],
 }
 
 
@@ -111,19 +119,26 @@ def generate_proposer_tasks(
 
         prompts = []
         for i in range(num_tasks):
-            # Sample ICL examples
-            examples = random.choice(
+            # Sample reference snippets
+            reference_snippets = random.choice(
                 seed_data,
-                size=min(config["n_icl_examples"], len(seed_data)),
+                size=min(config["io_n"], len(seed_data)),
                 replace=False
             ).tolist()
 
-            # Construct prompt
+            # Construct prompt using the correct API
             if problem_type in ["code_i", "code_o"]:
-                prompt = get_code_problem_generator_prompt(
+                generator_prompt = get_code_problem_generator_prompt(
                     problem_type=problem_type,
-                    examples=examples,
+                    reference_snippets=reference_snippets,
+                    banned_keywords=config["banned_keywords"],
+                    banned_assertion_keywords=config["banned_assertion_keywords"],
+                    composite_functions=[],
+                    remove_after_return=False,
+                    num_inputs=10,
+                    remove_input_from_snippet=False,
                 )
+                prompt = instruction_following.format(generator_prompt)
             else:
                 continue
 
