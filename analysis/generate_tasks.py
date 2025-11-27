@@ -192,16 +192,15 @@ def compute_self_consistency_entropy(answers: List[str]) -> Dict[str, float]:
     answers, signaling high uncertainty.
 
     Returns:
-        - entropy: Shannon entropy of the answer distribution (higher = more uncertain)
-        - normalized_entropy: Entropy normalized by log2(n_unique) for comparability
+        - normalized_entropy: Entropy normalized by log2(n_unique) for comparability (0 to 1)
     """
     if not answers:
-        return {"sc_entropy": float('nan'), "sc_entropy_normalized": float('nan')}
+        return {"sc_entropy_normalized": float('nan')}
 
     # Filter out None answers
     valid_answers = [a for a in answers if a is not None]
     if not valid_answers:
-        return {"sc_entropy": float('nan'), "sc_entropy_normalized": float('nan')}
+        return {"sc_entropy_normalized": float('nan')}
 
     # Count answer frequencies
     counter = Counter(valid_answers)
@@ -219,40 +218,10 @@ def compute_self_consistency_entropy(answers: List[str]) -> Dict[str, float]:
     normalized_entropy = entropy / max_entropy if max_entropy > 0 else 0.0
 
     return {
-        "sc_entropy": entropy,
         "sc_entropy_normalized": normalized_entropy,
     }
 
 
-def compute_agreement_rate(answers: List[str]) -> Dict[str, float]:
-    """
-    Compute Agreement Rate - the fraction of samples agreeing with the majority answer.
-
-    **Why it quantifies uncertainty:**
-    Agreement rate directly measures consensus among multiple samples. A high agreement
-    rate means the model consistently produces the same answer, indicating confidence.
-    A low agreement rate means samples disagree, indicating the model is uncertain about
-    which answer is correct. This is more interpretable than entropy.
-
-    Returns:
-        - agreement_rate: Fraction of samples matching the majority (0 to 1, higher = more certain)
-        - n_unique_answers: Number of distinct answers (more = more uncertain)
-    """
-    if not answers:
-        return {"agreement_rate": float('nan'), "n_unique_answers": 0}
-
-    valid_answers = [a for a in answers if a is not None]
-    if not valid_answers:
-        return {"agreement_rate": float('nan'), "n_unique_answers": 0}
-
-    counter = Counter(valid_answers)
-    most_common_count = counter.most_common(1)[0][1]
-    agreement_rate = most_common_count / len(valid_answers)
-
-    return {
-        "agreement_rate": agreement_rate,
-        "n_unique_answers": len(counter),
-    }
 
 
 def compute_sequence_logprob(cumulative_logprob: float, n_tokens: int) -> Dict[str, float]:
@@ -390,30 +359,21 @@ def compute_all_uncertainty_metrics(
     """
     metrics = {}
 
-    # 1. Self-Consistency Entropy
+    # 1. Self-Consistency Entropy (normalized)
     sc_metrics = compute_self_consistency_entropy(answers)
     metrics.update(sc_metrics)
 
-    # 2. Agreement Rate
-    agreement_metrics = compute_agreement_rate(answers)
-    metrics.update(agreement_metrics)
-
-    # 3. Lexical Diversity
+    # 2. Lexical Diversity
     diversity_metrics = compute_lexical_diversity(answers)
     metrics.update(diversity_metrics)
 
-    # 4. Sequence Log Probability (if available)
+    # 3. Sequence Log Probability (if available)
     if logprobs:
         # Average across samples
         avg_logprob = sum(lp for lp, _ in logprobs) / len(logprobs)
         avg_tokens = sum(nt for _, nt in logprobs) / len(logprobs)
         logprob_metrics = compute_sequence_logprob(avg_logprob, avg_tokens)
         metrics.update(logprob_metrics)
-
-        # Also compute variance of log probs across samples
-        if len(logprobs) > 1:
-            per_token_logprobs = [lp/nt if nt > 0 else 0 for lp, nt in logprobs]
-            metrics["logprob_variance"] = float(np.var(per_token_logprobs))
 
     return metrics
 

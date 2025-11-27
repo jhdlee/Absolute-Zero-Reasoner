@@ -241,18 +241,14 @@ def get_metric_direction(metric_name: str) -> bool:
     """
     # Metrics where HIGHER = MORE uncertain
     higher_is_uncertain = {
-        "sc_entropy",
         "sc_entropy_normalized",
-        "n_unique_answers",
         "lexical_ttr",
         "avg_pairwise_edit_dist",
         "perplexity",
-        "logprob_variance",
     }
 
     # Metrics where HIGHER = MORE certain (lower uncertainty)
     higher_is_certain = {
-        "agreement_rate",
         "seq_logprob",
         "seq_logprob_per_token",
         "verbalized_confidence",
