@@ -246,9 +246,6 @@ def get_metric_direction(metric_name: str) -> bool:
         "n_unique_answers",
         "lexical_ttr",
         "avg_pairwise_edit_dist",
-        "numeric_variance",
-        "numeric_std",
-        "numeric_range",
         "perplexity",
         "logprob_variance",
     }
@@ -271,7 +268,7 @@ def get_metric_direction(metric_name: str) -> bool:
 
 
 def plot_roc_curves(results: List[Dict], output_path: str):
-    """Plot ROC curves for all metrics."""
+    """Plot ROC curves for all metrics with distinct visual styles."""
     if not HAS_MATPLOTLIB:
         return
 
@@ -285,28 +282,82 @@ def plot_roc_curves(results: List[Dict], output_path: str):
     # Sort by AUROC
     valid_results.sort(key=lambda x: x.get("auroc", 0), reverse=True)
 
-    plt.figure(figsize=(10, 8))
+    # Distinct colors for better differentiation
+    distinct_colors = [
+        '#e41a1c',  # Red
+        '#377eb8',  # Blue
+        '#4daf4a',  # Green
+        '#984ea3',  # Purple
+        '#ff7f00',  # Orange
+        '#a65628',  # Brown
+        '#f781bf',  # Pink
+        '#999999',  # Gray
+        '#17becf',  # Cyan
+        '#bcbd22',  # Yellow-green
+    ]
 
-    colors = plt.cm.tab10(np.linspace(0, 1, len(valid_results)))
+    # Line styles for additional differentiation
+    line_styles = ['-', '--', '-.', ':']
+
+    # Markers (used sparingly for clarity)
+    markers = ['o', 's', '^', 'D', 'v', 'p', '*', 'X']
+
+    fig, ax = plt.subplots(figsize=(12, 9))
 
     for i, result in enumerate(valid_results):
         fpr = result["roc_curve"]["fpr"]
         tpr = result["roc_curve"]["tpr"]
         auroc = result.get("auroc", 0)
+
+        color = distinct_colors[i % len(distinct_colors)]
+        linestyle = line_styles[i % len(line_styles)]
+        marker = markers[i % len(markers)]
+
+        # Use markers only at intervals for clarity
+        markevery = max(1, len(fpr) // 8)
+
         label = f"{result['metric']} (AUROC={auroc:.3f})"
-        plt.plot(fpr, tpr, color=colors[i], linewidth=2, label=label)
+        ax.plot(
+            fpr, tpr,
+            color=color,
+            linestyle=linestyle,
+            linewidth=2.5,
+            marker=marker,
+            markersize=6,
+            markevery=markevery,
+            label=label,
+            alpha=0.85,
+        )
 
     # Diagonal line (random classifier)
-    plt.plot([0, 1], [0, 1], 'k--', linewidth=1, label='Random (AUROC=0.5)')
+    ax.plot([0, 1], [0, 1], 'k--', linewidth=1.5, alpha=0.5, label='Random (AUROC=0.5)')
 
-    plt.xlabel('False Positive Rate', fontsize=12)
-    plt.ylabel('True Positive Rate', fontsize=12)
-    plt.title('ROC Curves: Predicting Label Disagreement\n(Higher AUROC = Better at detecting unreliable LLM verification)', fontsize=12)
-    plt.legend(loc='lower right', fontsize=9)
-    plt.grid(True, alpha=0.3)
+    ax.set_xlabel('False Positive Rate', fontsize=14)
+    ax.set_ylabel('True Positive Rate', fontsize=14)
+    ax.set_title(
+        'ROC Curves: Predicting Label Disagreement\n'
+        '(Higher AUROC = Better at detecting when LLM verification is unreliable)',
+        fontsize=13
+    )
+
+    # Improved legend placement
+    ax.legend(
+        loc='lower right',
+        fontsize=10,
+        framealpha=0.9,
+        edgecolor='gray',
+    )
+
+    ax.grid(True, alpha=0.3, linestyle='-', linewidth=0.5)
+    ax.set_xlim(-0.02, 1.02)
+    ax.set_ylim(-0.02, 1.02)
+
+    # Add minor ticks
+    ax.minorticks_on()
+    ax.tick_params(axis='both', which='major', labelsize=11)
+
     plt.tight_layout()
-
-    plt.savefig(output_path, dpi=150, bbox_inches='tight')
+    plt.savefig(output_path, dpi=200, bbox_inches='tight', facecolor='white')
     plt.close()
     print(f"  ROC curves saved to: {output_path}")
 

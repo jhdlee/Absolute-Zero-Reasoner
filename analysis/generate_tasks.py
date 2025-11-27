@@ -363,56 +363,6 @@ def compute_lexical_diversity(answers: List[str]) -> Dict[str, float]:
     }
 
 
-def compute_answer_variance(answers: List[str]) -> Dict[str, float]:
-    """
-    Compute variance for numerical answers.
-
-    **Why it quantifies uncertainty:**
-    For tasks with numerical outputs, variance directly measures the spread of
-    predictions. High variance means the model produces widely different numerical
-    values across samples, indicating uncertainty about the correct value. This is
-    especially useful for regression-like tasks or when answers are numbers.
-
-    Returns:
-        - numeric_variance: Variance of numerical answers (nan if not numeric)
-        - numeric_std: Standard deviation
-        - numeric_range: Range (max - min) of values
-    """
-    if not answers:
-        return {"numeric_variance": float('nan'), "numeric_std": float('nan'), "numeric_range": float('nan')}
-
-    # Try to parse answers as numbers
-    numeric_values = []
-    for ans in answers:
-        if ans is None:
-            continue
-        try:
-            val = float(ans.strip())
-            numeric_values.append(val)
-        except (ValueError, AttributeError):
-            # Try to extract number from string
-            match = re.search(r'-?\d+\.?\d*', str(ans))
-            if match:
-                try:
-                    val = float(match.group())
-                    numeric_values.append(val)
-                except ValueError:
-                    pass
-
-    if len(numeric_values) < 2:
-        return {"numeric_variance": float('nan'), "numeric_std": float('nan'), "numeric_range": float('nan')}
-
-    variance = np.var(numeric_values)
-    std = np.std(numeric_values)
-    value_range = max(numeric_values) - min(numeric_values)
-
-    return {
-        "numeric_variance": float(variance),
-        "numeric_std": float(std),
-        "numeric_range": float(value_range),
-    }
-
-
 def extract_verbalized_confidence(response: str) -> Optional[float]:
     """Extract confidence score (0-100) from verbalized confidence response."""
     # Try to find a number in the response
@@ -452,11 +402,7 @@ def compute_all_uncertainty_metrics(
     diversity_metrics = compute_lexical_diversity(answers)
     metrics.update(diversity_metrics)
 
-    # 4. Numeric Variance (if applicable)
-    variance_metrics = compute_answer_variance(answers)
-    metrics.update(variance_metrics)
-
-    # 5. Sequence Log Probability (if available)
+    # 4. Sequence Log Probability (if available)
     if logprobs:
         # Average across samples
         avg_logprob = sum(lp for lp, _ in logprobs) / len(logprobs)
