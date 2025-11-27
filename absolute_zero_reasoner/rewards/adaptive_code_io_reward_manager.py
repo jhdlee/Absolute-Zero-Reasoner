@@ -351,7 +351,8 @@ class AdaptiveCodeIORewardManager(CodeIORewardManager):
 
         all_scores['accuracy'] = acc_rewards
         all_scores['format_score'] = [d['format_score'] for d in data_dicts]
-        all_scores['verification_method'] = ['llm'] * len(data_dicts)
+        # Note: verification_method removed from all_scores since it's a string and can't be averaged
+        # Use verification_llm_fraction metric instead for logging
 
         self.verification_stats["total_verifications"] += len(data)
 
@@ -598,7 +599,8 @@ class AdaptiveCodeIORewardManager(CodeIORewardManager):
 
         all_scores['accuracy'] = acc_rewards
         all_scores['format_score'] = [d['format_score'] for d in data_dicts]
-        all_scores['verification_method'] = verification_methods
+        # Note: verification_method removed from all_scores since it's a string and can't be averaged
+        # Use verification_execution_fraction / verification_llm_fraction metrics instead for logging
         all_scores['uncertainty'] = uncertainties
 
         self.verification_stats["total_verifications"] += len(data)
