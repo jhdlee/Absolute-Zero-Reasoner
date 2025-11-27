@@ -455,7 +455,7 @@ trainer:
   test_freq: -1
   critic_warmup: 0
   default_hdfs_dir: null
-  default_local_dir: checkpoints/code_io/${trainer.project_name}/${trainer.experiment_name}
+  default_local_dir: /scratch/users/hdlee/azr/checkpoints/code_io/${trainer.project_name}/${trainer.experiment_name}
   remove_previous_ckpt_in_save: False
   del_local_ckpt_after_load: False
   wandb_tags: null
