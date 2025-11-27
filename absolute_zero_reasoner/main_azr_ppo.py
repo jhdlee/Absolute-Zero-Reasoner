@@ -26,6 +26,7 @@ from verl.trainer.ppo.ray_trainer import ResourcePoolManager, Role
 
 from absolute_zero_reasoner.trainer.ppo.azr_ray_trainer import CodeIORayPPOTrainer
 from absolute_zero_reasoner.rewards.reward_managers import CodeIORewardManager
+from absolute_zero_reasoner.rewards.adaptive_code_io_reward_manager import AdaptiveCodeIORewardManager
 
 
 @hydra.main(config_path='configs', config_name='azr_ppo_trainer', version_base=None)
@@ -169,22 +170,48 @@ class TaskRunner:
             role_worker_mapping[Role.RefPolicy] = ray.remote(ActorRolloutRefWorker)
             mapping[Role.RefPolicy] = global_pool_id
 
-        reward_fn = CodeIORewardManager(
-            tokenizer=tokenizer,
-            num_examine=0,
-            reward_fn_extraction_type=config.reward_fn.extraction_type,
-            math_metric=config.reward_fn.math_metric,
-            split='train',
-            splitter=config.reward_fn.splitter,
-            output_path=config.trainer.default_local_dir,
-            max_prompt_length=config.data.max_prompt_length,
-            generation_reward_config=config.azr.reward.generation_reward_config,
-            valid_program_filter=config.azr.data_selection_strategy.valid_program_filter,
-            debug=config.trainer.debug,
-            extract_code_block=config.azr.reward.extract_code_block,
-            code_f_reward_type=config.azr.reward.code_f_reward_type,
-            boxed_retry=config.reward_fn.boxed_retry,
-        )
+        # Check if adaptive verification mode is configured
+        verification_mode = OmegaConf.select(config.azr, "verification_mode", default="full_execution")
+        use_adaptive = verification_mode in ["full_llm", "adaptive"]
+
+        if use_adaptive:
+            reward_fn = AdaptiveCodeIORewardManager(
+                tokenizer=tokenizer,
+                num_examine=0,
+                reward_fn_extraction_type=config.reward_fn.extraction_type,
+                math_metric=config.reward_fn.math_metric,
+                split='train',
+                splitter=config.reward_fn.splitter,
+                output_path=config.trainer.default_local_dir,
+                max_prompt_length=config.data.max_prompt_length,
+                generation_reward_config=config.azr.reward.generation_reward_config,
+                valid_program_filter=config.azr.data_selection_strategy.valid_program_filter,
+                debug=config.trainer.debug,
+                extract_code_block=config.azr.reward.extract_code_block,
+                code_f_reward_type=config.azr.reward.code_f_reward_type,
+                boxed_retry=config.reward_fn.boxed_retry,
+                verification_mode=verification_mode,
+                llm_for_verification=None,  # Will use rollout_actor_wg passed in __call__
+                budget_fraction=OmegaConf.select(config.azr, "verification_budget_fraction", default=0.3),
+                n_samples_for_uq=OmegaConf.select(config.azr, "n_samples_for_uq", default=8),
+            )
+        else:
+            reward_fn = CodeIORewardManager(
+                tokenizer=tokenizer,
+                num_examine=0,
+                reward_fn_extraction_type=config.reward_fn.extraction_type,
+                math_metric=config.reward_fn.math_metric,
+                split='train',
+                splitter=config.reward_fn.splitter,
+                output_path=config.trainer.default_local_dir,
+                max_prompt_length=config.data.max_prompt_length,
+                generation_reward_config=config.azr.reward.generation_reward_config,
+                valid_program_filter=config.azr.data_selection_strategy.valid_program_filter,
+                debug=config.trainer.debug,
+                extract_code_block=config.azr.reward.extract_code_block,
+                code_f_reward_type=config.azr.reward.code_f_reward_type,
+                boxed_retry=config.reward_fn.boxed_retry,
+            )
 
         # Note that we always use function-based RM for validation
         val_reward_fn = CodeIORewardManager(

@@ -1,0 +1,77 @@
+# Verification Experiment Configuration
+# Trains from base Qwen2.5-Coder-3B with code_i and code_o tasks only
+# Supports three verification modes: full_execution, full_llm, adaptive
+#
+# Usage:
+#   python main_azr_ppo.py --config-name=verification_experiment \
+#     azr.verification_mode=full_execution  # or full_llm or adaptive
+#
+defaults:
+  - azr_ppo_trainer
+
+# Override model to use base Qwen2.5-Coder-3B (not pre-trained AZR)
+actor_rollout_ref:
+  model:
+    path: Qwen/Qwen2.5-Coder-3B
+    pretrained_tokenizer: True  # Use base model chat template
+    trust_remote_code: True
+  rollout:
+    temperature: 0.7
+    top_p: 0.95
+    tensor_model_parallel_size: 1
+    gpu_memory_utilization: 0.5
+
+# Critic uses same model
+critic:
+  model:
+    path: ${actor_rollout_ref.model.path}
+
+# Data configuration
+data:
+  max_prompt_length: 4096
+  max_response_length: 4096
+  train_batch_size: 256  # Smaller batch for faster iteration
+
+# Training configuration
+trainer:
+  project_name: verification_experiment
+  experiment_name: code_io_base_3b
+  total_epochs: 10
+  test_freq: 1  # Evaluate every epoch for frequent tracking
+  save_freq: 2  # Save every 2 epochs
+  logger: ['console', 'wandb']
+  n_gpus_per_node: 4  # Adjust based on your setup
+
+# AZR specific configuration
+azr:
+  # Only use code_i and code_o tasks
+  problem_types:
+    - code_i
+    - code_o
+
+  # Verification mode: full_execution, full_llm, or adaptive
+  verification_mode: full_execution
+
+  # Adaptive mode settings (used when verification_mode=adaptive)
+  verification_budget_fraction: 0.3  # 30% of high-uncertainty tasks use execution
+  n_samples_for_uq: 8  # Number of samples for uncertainty estimation
+
+  # Executor settings
+  executor: qwq
+  execute_max_timeout: 10
+
+  # Data selection
+  data_selection_strategy:
+    io_n: 6
+    update_iteration: 1
+    valid_program_filter: all
+
+  # Reward configuration
+  reward:
+    n_samples: 8
+    extract_code_block: True
+    generation_reward_config:
+      format_reward: True
+      reject_multiple_functions: True
+      generation_accuracy_convertion: one_minus
+
