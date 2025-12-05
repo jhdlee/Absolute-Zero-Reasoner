@@ -571,6 +571,11 @@ class AdaptiveCodeIORewardManager(CodeIORewardManager):
                 problem_type=problem_types[i],
             )
 
+            # Skip empty prompts (e.g., unsupported problem types)
+            if not prompt or not prompt.strip():
+                print(f"[DEBUG] Skipping task {i}: empty reflection prompt for {problem_types[i]}")
+                continue
+
             # Debug: log first few prompts
             if self._debug_log_count < 3:
                 print(f"[DEBUG Reflection Prompt {self._debug_log_count}]")
@@ -685,7 +690,7 @@ class AdaptiveCodeIORewardManager(CodeIORewardManager):
             print(f"\n[DEBUG ERROR] Reflection sampling failed!")
             print(f"  Exception type: {type(e).__name__}")
             print(f"  Exception message: {e}")
-            PrettyPrinter.print_colored(f"Reflection sampling failed: {e}", "red")
+            PrettyPrinter.status("ERROR", f"Reflection sampling failed: {e}", "error")
             import traceback
             traceback.print_exc()
             return {}
@@ -732,6 +737,33 @@ Predicted Input: {answer}
 
 Think step by step about what input would produce the expected output, then answer:
 Is the predicted input correct? Answer with CORRECT or INCORRECT."""
+
+        elif problem_type.endswith('code_f'):
+            # For pred_code_f: given_inputs/given_outputs are shown to the model
+            given_inputs = data_dict.get('given_inputs', [])
+            given_outputs = data_dict.get('given_outputs', [])
+            message = data_dict.get('message', '')
+
+            # Format given I/O pairs (what the model saw)
+            io_pairs = []
+            for i, (inp, out) in enumerate(zip(given_inputs[:3], given_outputs[:3])):
+                io_pairs.append(f"  Input {i+1}: {inp}\n  Output {i+1}: {out}")
+            io_str = "\n".join(io_pairs) if io_pairs else "  (no examples provided)"
+
+            return f"""Given a function completion task, determine if the predicted implementation is correct.
+
+Task Description: {message}
+
+Predicted Function:
+```python
+{answer}
+```
+
+Example Input/Output pairs:
+{io_str}
+
+Think step by step about whether the predicted function would produce the correct outputs for the given inputs, then answer:
+Is the predicted function correct? Answer with CORRECT or INCORRECT."""
 
         return ""
 
