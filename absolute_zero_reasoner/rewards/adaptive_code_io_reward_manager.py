@@ -121,12 +121,14 @@ class AdaptiveCodeIORewardManager(CodeIORewardManager):
 
         # Debug counters
         self._debug_log_count = 0
+        self._debug_vote_count = 0
 
     def reset_stats(self):
         """Reset verification statistics."""
         for key in self.verification_stats:
             self.verification_stats[key] = 0 if isinstance(self.verification_stats[key], int) else 0.0
         self._debug_log_count = 0
+        self._debug_vote_count = 0
 
     def __call__(
         self,
@@ -231,12 +233,35 @@ class AdaptiveCodeIORewardManager(CodeIORewardManager):
         else:
             problem_types = [problem_type] * len(data)
 
+        print(f"\n{'='*60}")
+        print(f"[DEBUG LLM VERIFICATION] Starting with {len(data)} tasks")
+        print(f"  problem_type: {problem_type}")
+        print(f"  n_samples_for_uq: {self.n_samples_for_uq}")
+        print(f"{'='*60}")
+
         PrettyPrinter.section_header("Getting Data Dicts for LLM Verification")
         for i in range(len(data)):
             data_dict = self._get_data_dict(
                 data[i], problem_types[i], executor, banned_words, uids[i], banned_assertion_keywords
             )
             data_dicts.append(data_dict)
+
+        # Debug: analyze data_dicts
+        n_valid_format = sum(1 for d in data_dicts if d.get('format_score', False))
+        n_has_answer = sum(1 for d in data_dicts if d.get('answer') is not None)
+        print(f"\n[DEBUG DATA DICTS]")
+        print(f"  Total tasks: {len(data_dicts)}")
+        print(f"  Valid format_score: {n_valid_format}")
+        print(f"  Has answer: {n_has_answer}")
+
+        # Show first few data_dicts
+        for i, d in enumerate(data_dicts[:3]):
+            print(f"\n  [Task {i}]")
+            print(f"    format_score: {d.get('format_score')}")
+            print(f"    answer: {str(d.get('answer'))[:100] if d.get('answer') else 'None'}...")
+            print(f"    program: {str(d.get('program'))[:80] if d.get('program') else 'None'}...")
+            print(f"    input: {str(d.get('input'))[:50] if d.get('input') else 'None'}")
+            print(f"    output: {str(d.get('output'))[:50] if d.get('output') else 'None'}")
 
         # Get reflection votes for all valid tasks
         PrettyPrinter.section_header(f"LLM Reflection Verification (N={self.n_samples_for_uq} reflections per task)")
@@ -246,6 +271,20 @@ class AdaptiveCodeIORewardManager(CodeIORewardManager):
             problem_types=problem_types,
             rollout_actor_wg=rollout_actor_wg,
         )
+
+        print(f"\n[DEBUG REFLECTION RESULTS]")
+        print(f"  Tasks with reflection results: {len(reflection_results)}")
+        if reflection_results:
+            # Show vote distribution for first few tasks
+            for task_idx, result in list(reflection_results.items())[:5]:
+                votes = result.get('votes', [])
+                responses = result.get('responses', [])
+                print(f"\n  [Task {task_idx}]")
+                print(f"    Votes: {votes}")
+                print(f"    CORRECT count: {sum(votes)}/{len(votes)}")
+                print(f"    Majority: {'CORRECT' if sum(votes) > len(votes)/2 else 'INCORRECT'}")
+                if responses:
+                    print(f"    First response (truncated): {responses[0][:200]}...")
 
         # Compute rewards based on majority voting
         acc_rewards = []
@@ -288,6 +327,15 @@ class AdaptiveCodeIORewardManager(CodeIORewardManager):
         all_scores['verification_llm_count'] = [len(reflection_results)]
         all_scores['verification_execution_fraction'] = [0.0]
         all_scores['verification_llm_fraction'] = [1.0]
+
+        # Debug: final summary
+        print(f"\n[DEBUG FINAL SUMMARY]")
+        print(f"  Total tasks: {len(data_dicts)}")
+        print(f"  Tasks with reflection results: {len(reflection_results)}")
+        print(f"  Accuracy rewards: {acc_rewards[:10]}... (first 10)")
+        print(f"  Mean accuracy: {np.mean(acc_rewards):.4f}")
+        print(f"  Correct predictions: {len(correct_predictions)}")
+        print(f"{'='*60}\n")
 
         return reward_tensor, all_scores, [], correct_predictions
 
@@ -503,13 +551,17 @@ class AdaptiveCodeIORewardManager(CodeIORewardManager):
         # Prepare reflection prompts for valid tasks
         reflection_prompts = []
         valid_indices = []
+        skipped_format = 0
+        skipped_answer = 0
 
         for i, data_dict in enumerate(data_dicts):
             if not data_dict['format_score']:
+                skipped_format += 1
                 continue
 
             answer = data_dict.get('answer')
             if answer is None:
+                skipped_answer += 1
                 continue
 
             prompt = self._construct_reflection_prompt(
@@ -535,10 +587,20 @@ class AdaptiveCodeIORewardManager(CodeIORewardManager):
             valid_indices.append(i)
 
         if not reflection_prompts:
+            print(f"[DEBUG] No reflection prompts to generate")
+            print(f"  Skipped due to format_score=False: {skipped_format}")
+            print(f"  Skipped due to answer=None: {skipped_answer}")
             return {}
 
         # Repeat prompts N times for sampling
         prompts_repeated = reflection_prompts * self.n_samples_for_uq
+
+        print(f"\n[DEBUG REFLECTION GENERATION]")
+        print(f"  Total tasks: {len(data_dicts)}")
+        print(f"  Skipped (format_score=False): {skipped_format}")
+        print(f"  Skipped (answer=None): {skipped_answer}")
+        print(f"  Valid tasks for reflection: {len(reflection_prompts)}")
+        print(f"  Total prompts (N={self.n_samples_for_uq} samples): {len(prompts_repeated)}")
 
         try:
             start_time = time.time()
@@ -618,6 +680,9 @@ class AdaptiveCodeIORewardManager(CodeIORewardManager):
             return results
 
         except Exception as e:
+            print(f"\n[DEBUG ERROR] Reflection sampling failed!")
+            print(f"  Exception type: {type(e).__name__}")
+            print(f"  Exception message: {e}")
             PrettyPrinter.print_colored(f"Reflection sampling failed: {e}", "red")
             import traceback
             traceback.print_exc()
@@ -686,6 +751,16 @@ Is the predicted input correct? Answer with CORRECT or INCORRECT."""
             "WOULD PRODUCE", "MATCHES", "EQUAL",
         ]
 
+        # Debug: log extraction for first few responses
+        if self._debug_vote_count < 10:
+            matched_neg = [p for p in negative_patterns if p in response_upper]
+            matched_pos = [p for p in positive_patterns if p in response_upper]
+            print(f"[DEBUG VOTE EXTRACTION {self._debug_vote_count}]")
+            print(f"  Response (first 150 chars): {response[:150]}...")
+            print(f"  Matched negative: {matched_neg}")
+            print(f"  Matched positive: {matched_pos}")
+            self._debug_vote_count += 1
+
         # Check negative patterns first
         for pattern in negative_patterns:
             if pattern in response_upper:
@@ -697,6 +772,10 @@ Is the predicted input correct? Answer with CORRECT or INCORRECT."""
                 return True
 
         # Default to incorrect if unclear
+        if self._debug_vote_count < 15:
+            print(f"  -> Defaulting to INCORRECT (no patterns matched)")
+            self._debug_vote_count += 1
+
         return False
 
     def _compute_vote_entropy(self, votes: List[bool]) -> float:

@@ -70,6 +70,7 @@ python -m absolute_zero_reasoner.main_azr_ppo \
     azr.reward.n_samples=8 \
     azr.problem_types=['code_i','code_o','code_f'] \
     azr.verification_mode=full_llm \
+    azr.n_samples_for_uq=8 \
     trainer.debug=False \
     azr.reward.generation_reward_config.complexity_reward.enabled=False \
     azr.reward.generation_reward_config.mean_edit_distance_reward.enabled=False \
