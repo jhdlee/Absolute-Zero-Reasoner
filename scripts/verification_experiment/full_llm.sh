@@ -62,11 +62,13 @@ python -m absolute_zero_reasoner.main_azr_ppo \
     azr.data_selection_strategy.update_iteration=1 \
     azr.seed_dataset=data/3b_coder_seed_io.jsonl \
     azr.output_seed_path=data/3b_coder_seed_io.jsonl \
+    azr.code_f_seed_dataset=data/3b_coder_code_f_seed_io.jsonl \
+    azr.output_code_f_seed_path=data/3b_coder_code_f_seed_io.jsonl \
     azr.pretrain_pred_steps=-1 \
     azr.executor=qwq \
     azr.ast_check=True \
     azr.reward.n_samples=8 \
-    azr.problem_types=['code_i','code_o'] \
+    azr.problem_types=['code_i','code_o','code_f'] \
     azr.verification_mode=full_llm \
     trainer.debug=False \
     azr.reward.generation_reward_config.complexity_reward.enabled=False \
