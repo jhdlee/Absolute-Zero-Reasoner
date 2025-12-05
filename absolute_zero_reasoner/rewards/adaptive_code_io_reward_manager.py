@@ -3,18 +3,23 @@ Adaptive Code I/O Reward Manager for Uncertainty-Guided Verification
 
 This module extends the CodeIORewardManager to support three verification modes:
 1. FULL_EXECUTION: Always use Python executor (ground truth)
-2. FULL_LLM: Always use LLM-as-a-judge
-3. ADAPTIVE: Use uncertainty (sc_entropy_normalized) to decide, with a budget constraint
+2. FULL_LLM: Always use LLM reflection with majority voting (no execution)
+3. ADAPTIVE: Use reflection vote entropy to route uncertain tasks to execution
 
-The adaptive mode uses uncertainty quantification to determine when the LLM
-verification is likely to be unreliable, and falls back to execution.
+The key idea:
+- For each task, the solver outputs ONE answer
+- The solver is prompted N times with a reflection prompt asking "Is this answer correct?"
+- Majority voting of reflections determines correctness (Full LLM mode)
+- Entropy of reflection votes measures uncertainty (Adaptive mode)
+- High entropy (mixed votes) → uncertain → use execution
+- Low entropy (consistent votes) → confident → trust majority vote
 """
 
 import os
 import time
 import math
 from typing import Dict, Any, List, Tuple, Optional
-from collections import defaultdict, Counter
+from collections import defaultdict
 from enum import Enum
 import uuid
 
@@ -26,7 +31,6 @@ from verl import DataProto
 from verl.protocol import DataProtoItem
 
 from absolute_zero_reasoner.rewards.reward_managers import CodeIORewardManager
-from absolute_zero_reasoner.rewards.custom_evaluate import extract_answer
 from absolute_zero_reasoner.utils.logging_utils.stdout import PrettyPrinter
 
 
@@ -42,8 +46,8 @@ class AdaptiveCodeIORewardManager(CodeIORewardManager):
     Extended reward manager that supports different verification strategies.
 
     Inherits from CodeIORewardManager and adds:
-    - LLM-as-a-judge verification
-    - Adaptive verification using uncertainty quantification
+    - LLM reflection-based verification with majority voting
+    - Adaptive verification using reflection vote entropy
     - Tracking of verification statistics
     """
 
@@ -65,7 +69,7 @@ class AdaptiveCodeIORewardManager(CodeIORewardManager):
         num_inputs: int = 10,
         code_f_reward_type: str = 'accuracy',
         boxed_retry: bool = False,
-        # New adaptive verification params
+        # Adaptive verification params
         verification_mode: str = "full_execution",
         llm_for_verification = None,
         budget_fraction: float = 0.3,
@@ -75,9 +79,9 @@ class AdaptiveCodeIORewardManager(CodeIORewardManager):
         Args:
             ... (all base class params)
             verification_mode: "full_execution", "full_llm", or "adaptive"
-            llm_for_verification: vLLM instance for LLM verification (required for full_llm/adaptive)
+            llm_for_verification: Not used (kept for API compatibility)
             budget_fraction: Fraction of high-uncertainty tasks to verify with execution in adaptive mode
-            n_samples_for_uq: Number of samples for uncertainty quantification
+            n_samples_for_uq: Number of reflection samples for uncertainty quantification
         """
         super().__init__(
             tokenizer=tokenizer,
@@ -99,7 +103,7 @@ class AdaptiveCodeIORewardManager(CodeIORewardManager):
         )
 
         self.verification_mode = VerificationMode(verification_mode)
-        self.llm_for_verification = llm_for_verification  # Can be None, will use rollout_actor_wg
+        self.llm_for_verification = llm_for_verification  # Kept for API compatibility
         self.budget_fraction = budget_fraction
         self.n_samples_for_uq = n_samples_for_uq
 
@@ -110,17 +114,19 @@ class AdaptiveCodeIORewardManager(CodeIORewardManager):
             "llm_verifications": 0,
             "execution_time_ms": 0.0,
             "llm_time_ms": 0.0,
-            "agreements": 0,
-            "disagreements": 0,
         }
 
         # Track per-step metrics for logging
         self.step_stats = []
 
+        # Debug counters
+        self._debug_log_count = 0
+
     def reset_stats(self):
         """Reset verification statistics."""
         for key in self.verification_stats:
             self.verification_stats[key] = 0 if isinstance(self.verification_stats[key], int) else 0.0
+        self._debug_log_count = 0
 
     def __call__(
         self,
@@ -206,13 +212,13 @@ class AdaptiveCodeIORewardManager(CodeIORewardManager):
         rollout_actor_wg=None,
     ) -> Tuple[torch.Tensor, Dict, List[Dict], List[Dict]]:
         """
-        Compute rewards using LLM-as-a-judge verification for prediction tasks.
-        Uses the rollout_actor_wg (the solver model itself) for verification.
-        """
-        from verl.utils.dataset.rl_dataset import collate_fn
-        from verl.protocol import pad_dataproto_to_divisor, unpad_dataproto
-        from absolute_zero_reasoner.utils.dataset.rl_dataset import RLHFDataset
+        Compute rewards using LLM reflection with majority voting.
 
+        For each task:
+        1. Solver has already produced ONE answer
+        2. Prompt N times asking "Is this answer correct?"
+        3. Majority vote of reflections determines correctness
+        """
         reward_tensor = torch.zeros_like(data.batch['responses'], dtype=torch.float32)
         all_scores = defaultdict(list)
         data_dicts = []
@@ -232,98 +238,16 @@ class AdaptiveCodeIORewardManager(CodeIORewardManager):
             )
             data_dicts.append(data_dict)
 
-        # Construct LLM verification prompts
-        PrettyPrinter.section_header("LLM Verification for Prediction Tasks")
-        verifier_prompts_data = []
-        valid_indices = []
+        # Get reflection votes for all valid tasks
+        PrettyPrinter.section_header(f"LLM Reflection Verification (N={self.n_samples_for_uq} reflections per task)")
 
-        for i, data_dict in enumerate(data_dicts):
-            if not data_dict['format_score']:
-                continue
+        reflection_results = self._get_reflection_votes_batch(
+            data_dicts=data_dicts,
+            problem_types=problem_types,
+            rollout_actor_wg=rollout_actor_wg,
+        )
 
-            answer = data_dict.get('answer')
-            if answer is None:
-                continue
-
-            prompt = self._construct_verifier_prompt(
-                data_dict=data_dict,
-                problem_type=problem_types[i],
-            )
-            verifier_prompts_data.append({
-                'prompt': [{'role': 'user', 'content': prompt}],
-                'uid': data_dict['uid'],
-                'data_source': data_dict['data_source'],
-                'extra_info': data_dict['extra_info'],
-                'ground_truth': '',
-            })
-            valid_indices.append(i)
-
-        # Batch LLM verification using rollout_actor_wg
-        llm_verdicts = {}
-        if verifier_prompts_data and rollout_actor_wg is not None:
-            start_time = time.time()
-
-            # Create temporary dataset for verification prompts
-            import os
-            temp_path = f'{self.output_path}/temp_verifier.parquet'
-            pd.DataFrame(verifier_prompts_data).to_parquet(temp_path)
-
-            temp_data = RLHFDataset(
-                parquet_files=temp_path,
-                tokenizer=self.tokenizer,
-                prompt_key='prompt',
-                max_prompt_length=self.max_prompt_length,
-                filter_prompts=True,
-                return_raw_chat=False,
-                truncation='error'
-            )
-            os.remove(temp_path)
-
-            sampler = torch.utils.data.SequentialSampler(data_source=temp_data)
-            dataloader = torch.utils.data.DataLoader(
-                dataset=temp_data,
-                batch_size=len(temp_data),
-                drop_last=False,
-                shuffle=False,
-                collate_fn=collate_fn,
-                sampler=sampler,
-            )
-
-            batch_data = next(iter(dataloader))
-            gen_batch = DataProto.from_single_dict(batch_data)
-            gen_batch = gen_batch.pop(['input_ids', 'attention_mask', 'position_ids'])
-            gen_batch.meta_info = {
-                'eos_token_id': self.tokenizer.eos_token_id,
-                'pad_token_id': self.tokenizer.pad_token_id,
-                'recompute_log_prob': False,
-                'do_sample': False,  # Greedy for verification
-                'validate': False,
-            }
-
-            # Generate
-            gen_batch_padded, pad_size = pad_dataproto_to_divisor(gen_batch, rollout_actor_wg.world_size)
-            output_gen_batch_padded = rollout_actor_wg.generate_sequences(gen_batch_padded)
-            output_gen_batch = unpad_dataproto(output_gen_batch_padded, pad_size=pad_size)
-
-            llm_time = (time.time() - start_time) * 1000
-
-            # Extract verdicts
-            for out_idx in range(len(output_gen_batch)):
-                response = self.tokenizer.decode(
-                    output_gen_batch[out_idx].batch['responses'],
-                    skip_special_tokens=True
-                )
-                task_idx = valid_indices[out_idx]
-                verdict = self._extract_llm_verdict(response)
-                llm_verdicts[task_idx] = {
-                    "verdict": verdict,
-                    "response": response,
-                }
-
-            self.verification_stats["llm_verifications"] += len(verifier_prompts_data)
-            self.verification_stats["llm_time_ms"] += llm_time
-
-        # Compute rewards based on LLM verdicts
+        # Compute rewards based on majority voting
         acc_rewards = []
         for i, data_dict in enumerate(data_dicts):
             valid_response_length = data_dict['valid_response_length']
@@ -331,13 +255,17 @@ class AdaptiveCodeIORewardManager(CodeIORewardManager):
             if not data_dict['format_score']:
                 acc_reward = 0.0
                 reward_tensor[i, valid_response_length - 1] = -1.0
-            elif i in llm_verdicts:
-                acc_reward = 1.0 if llm_verdicts[i]["verdict"] else 0.0
+            elif i in reflection_results:
+                votes = reflection_results[i]['votes']
+                correct_count = sum(votes)
+                total_votes = len(votes)
+
+                # Majority voting
+                majority_correct = correct_count > total_votes / 2
+                acc_reward = 1.0 if majority_correct else 0.0
+
                 if self.split == 'train':
-                    if acc_reward > 0:
-                        reward_tensor[i, valid_response_length - 1] = acc_reward
-                    else:
-                        reward_tensor[i, valid_response_length - 1] = -0.5
+                    reward_tensor[i, valid_response_length - 1] = acc_reward if acc_reward > 0 else -0.5
                 else:
                     reward_tensor[i, valid_response_length - 1] = acc_reward
 
@@ -351,14 +279,13 @@ class AdaptiveCodeIORewardManager(CodeIORewardManager):
 
         all_scores['accuracy'] = acc_rewards
         all_scores['format_score'] = [d['format_score'] for d in data_dicts]
-        # Note: verification_method removed from all_scores since it's a string and can't be averaged
-        # Use verification_llm_fraction metric instead for logging
 
         self.verification_stats["total_verifications"] += len(data)
+        self.verification_stats["llm_verifications"] += len(reflection_results)
 
-        # Add verification metrics to all_scores for logging
+        # Add verification metrics
         all_scores['verification_execution_count'] = [0]
-        all_scores['verification_llm_count'] = [len(verifier_prompts_data)]
+        all_scores['verification_llm_count'] = [len(reflection_results)]
         all_scores['verification_execution_fraction'] = [0.0]
         all_scores['verification_llm_fraction'] = [1.0]
 
@@ -375,19 +302,14 @@ class AdaptiveCodeIORewardManager(CodeIORewardManager):
         n_samples: int,
     ) -> Tuple[torch.Tensor, Dict, List[Dict], List[Dict]]:
         """
-        Compute rewards using adaptive verification based on uncertainty.
+        Compute rewards using adaptive verification based on reflection vote entropy.
 
         Strategy:
-        1. Get data dicts with format checks
-        2. For valid predictions, compute uncertainty using self-consistency
-        3. Sort by uncertainty
-        4. Use execution for top budget_fraction of high-uncertainty tasks
-        5. Use LLM for the rest
+        1. For each task, get N reflection votes
+        2. Compute entropy of votes (high entropy = uncertain)
+        3. Route high-entropy tasks to execution verification
+        4. Route low-entropy tasks to majority vote from reflections
         """
-        from verl.utils.dataset.rl_dataset import collate_fn
-        from verl.protocol import pad_dataproto_to_divisor, unpad_dataproto
-        from absolute_zero_reasoner.utils.dataset.rl_dataset import RLHFDataset
-
         reward_tensor = torch.zeros_like(data.batch['responses'], dtype=torch.float32)
         all_scores = defaultdict(list)
         data_dicts = []
@@ -407,21 +329,34 @@ class AdaptiveCodeIORewardManager(CodeIORewardManager):
             )
             data_dicts.append(data_dict)
 
-        # Compute uncertainties using self-consistency sampling
-        PrettyPrinter.section_header("Computing Uncertainties via Self-Consistency")
-        uncertainties = self._compute_uncertainties_batch(data_dicts, problem_types, rollout_actor_wg)
+        # Get reflection votes and compute entropy for all valid tasks
+        PrettyPrinter.section_header(f"Computing Reflection Votes (N={self.n_samples_for_uq})")
 
-        for i, unc in enumerate(uncertainties):
-            data_dicts[i]['uncertainty'] = unc
+        reflection_results = self._get_reflection_votes_batch(
+            data_dicts=data_dicts,
+            problem_types=problem_types,
+            rollout_actor_wg=rollout_actor_wg,
+        )
 
-        # Get valid indices (those with format_score > 0)
-        valid_indices = [i for i, d in enumerate(data_dicts) if d['format_score'] > 0]
+        # Compute entropies and store in data_dicts
+        uncertainties = []
+        valid_indices = []
+        for i, data_dict in enumerate(data_dicts):
+            if i in reflection_results:
+                votes = reflection_results[i]['votes']
+                entropy = self._compute_vote_entropy(votes)
+                data_dict['uncertainty'] = entropy
+                data_dict['reflection_votes'] = votes
+                uncertainties.append(entropy)
+                valid_indices.append(i)
+            else:
+                data_dict['uncertainty'] = 1.0  # Max uncertainty for invalid
+                uncertainties.append(1.0)
 
         if not valid_indices:
             # All invalid, return early
             all_scores['accuracy'] = [0.0] * len(data_dicts)
             all_scores['format_score'] = [d['format_score'] for d in data_dicts]
-            all_scores['verification_method'] = ['none'] * len(data_dicts)
             all_scores['uncertainty'] = uncertainties
             return reward_tensor, all_scores, [], []
 
@@ -432,17 +367,17 @@ class AdaptiveCodeIORewardManager(CodeIORewardManager):
             reverse=True
         )
 
-        # Determine which tasks use execution vs LLM
+        # Determine which tasks use execution vs LLM majority vote
         n_execution = int(len(sorted_valid_indices) * self.budget_fraction)
         execution_indices = set(sorted_valid_indices[:n_execution])
         llm_indices = set(sorted_valid_indices[n_execution:])
 
+        PrettyPrinter.section_header(f"Execution Verification ({len(execution_indices)} high-uncertainty tasks)")
+
         # Verify with execution (high uncertainty)
-        PrettyPrinter.section_header(f"Execution Verification ({len(execution_indices)} tasks)")
         exec_rewards = {}
         for i in execution_indices:
             start_time = time.time()
-
             data_dict = data_dicts[i]
             answer = data_dict.get('answer')
             imports = data_dict.get('imports', [])
@@ -474,133 +409,49 @@ class AdaptiveCodeIORewardManager(CodeIORewardManager):
             self.verification_stats["execution_verifications"] += 1
             self.verification_stats["execution_time_ms"] += exec_time
 
-        # Verify with LLM using rollout_actor_wg (low uncertainty)
-        PrettyPrinter.section_header(f"LLM Verification ({len(llm_indices)} tasks)")
+        PrettyPrinter.section_header(f"LLM Majority Vote ({len(llm_indices)} low-uncertainty tasks)")
+
+        # Use majority vote from reflections (low uncertainty)
         llm_rewards = {}
-
-        if llm_indices and rollout_actor_wg is not None:
-            verifier_prompts_data = []
-            prompt_to_idx = []
-
-            for i in llm_indices:
-                data_dict = data_dicts[i]
-                if data_dict.get('answer') is not None:
-                    prompt = self._construct_verifier_prompt(data_dict, problem_types[i])
-                    verifier_prompts_data.append({
-                        'prompt': [{'role': 'user', 'content': prompt}],
-                        'uid': data_dict['uid'],
-                        'data_source': data_dict['data_source'],
-                        'extra_info': data_dict['extra_info'],
-                        'ground_truth': '',
-                    })
-                    prompt_to_idx.append(i)
-
-            if verifier_prompts_data:
-                start_time = time.time()
-
-                # Create temporary dataset for verification prompts
-                import os
-                temp_path = f'{self.output_path}/temp_verifier_adaptive.parquet'
-                pd.DataFrame(verifier_prompts_data).to_parquet(temp_path)
-
-                temp_data = RLHFDataset(
-                    parquet_files=temp_path,
-                    tokenizer=self.tokenizer,
-                    prompt_key='prompt',
-                    max_prompt_length=self.max_prompt_length,
-                    filter_prompts=True,
-                    return_raw_chat=False,
-                    truncation='error'
-                )
-                os.remove(temp_path)
-
-                sampler = torch.utils.data.SequentialSampler(data_source=temp_data)
-                dataloader = torch.utils.data.DataLoader(
-                    dataset=temp_data,
-                    batch_size=len(temp_data),
-                    drop_last=False,
-                    shuffle=False,
-                    collate_fn=collate_fn,
-                    sampler=sampler,
-                )
-
-                batch_data = next(iter(dataloader))
-                gen_batch = DataProto.from_single_dict(batch_data)
-                gen_batch = gen_batch.pop(['input_ids', 'attention_mask', 'position_ids'])
-                gen_batch.meta_info = {
-                    'eos_token_id': self.tokenizer.eos_token_id,
-                    'pad_token_id': self.tokenizer.pad_token_id,
-                    'recompute_log_prob': False,
-                    'do_sample': False,  # Greedy for verification
-                    'validate': False,
-                }
-
-                # Generate
-                gen_batch_padded, pad_size = pad_dataproto_to_divisor(gen_batch, rollout_actor_wg.world_size)
-                output_gen_batch_padded = rollout_actor_wg.generate_sequences(gen_batch_padded)
-                output_gen_batch = unpad_dataproto(output_gen_batch_padded, pad_size=pad_size)
-
-                llm_time = (time.time() - start_time) * 1000
-
-                # Extract verdicts
-                for out_idx in range(len(output_gen_batch)):
-                    response = self.tokenizer.decode(
-                        output_gen_batch[out_idx].batch['responses'],
-                        skip_special_tokens=True
-                    )
-                    task_idx = prompt_to_idx[out_idx]
-                    verdict = self._extract_llm_verdict(response)
-                    llm_rewards[task_idx] = 1.0 if verdict else 0.0
-
-                self.verification_stats["llm_verifications"] += len(verifier_prompts_data)
-                self.verification_stats["llm_time_ms"] += llm_time
+        for i in llm_indices:
+            if i in reflection_results:
+                votes = reflection_results[i]['votes']
+                correct_count = sum(votes)
+                majority_correct = correct_count > len(votes) / 2
+                llm_rewards[i] = 1.0 if majority_correct else 0.0
+                self.verification_stats["llm_verifications"] += 1
 
         # Combine rewards and compute final tensor
         acc_rewards = []
-        verification_methods = []
-
         for i, data_dict in enumerate(data_dicts):
             valid_response_length = data_dict['valid_response_length']
 
             if not data_dict['format_score']:
                 acc_reward = 0.0
-                method = 'none'
                 reward_tensor[i, valid_response_length - 1] = -1.0
             elif i in exec_rewards:
                 acc_reward = exec_rewards[i]
-                method = 'execution'
                 if self.split == 'train':
-                    if acc_reward > 0:
-                        reward_tensor[i, valid_response_length - 1] = acc_reward
-                    else:
-                        reward_tensor[i, valid_response_length - 1] = -0.5
+                    reward_tensor[i, valid_response_length - 1] = acc_reward if acc_reward > 0 else -0.5
                 else:
                     reward_tensor[i, valid_response_length - 1] = acc_reward
             elif i in llm_rewards:
                 acc_reward = llm_rewards[i]
-                method = 'llm'
                 if self.split == 'train':
-                    if acc_reward > 0:
-                        reward_tensor[i, valid_response_length - 1] = acc_reward
-                    else:
-                        reward_tensor[i, valid_response_length - 1] = -0.5
+                    reward_tensor[i, valid_response_length - 1] = acc_reward if acc_reward > 0 else -0.5
                 else:
                     reward_tensor[i, valid_response_length - 1] = acc_reward
             else:
                 acc_reward = 0.0
-                method = 'none'
                 reward_tensor[i, valid_response_length - 1] = -0.5
 
             if acc_reward > 0:
                 correct_predictions.append(data_dict)
 
             acc_rewards.append(acc_reward)
-            verification_methods.append(method)
 
         all_scores['accuracy'] = acc_rewards
         all_scores['format_score'] = [d['format_score'] for d in data_dicts]
-        # Note: verification_method removed from all_scores since it's a string and can't be averaged
-        # Use verification_execution_fraction / verification_llm_fraction metrics instead for logging
         all_scores['uncertainty'] = uncertainties
 
         self.verification_stats["total_verifications"] += len(data)
@@ -616,7 +467,7 @@ class AdaptiveCodeIORewardManager(CodeIORewardManager):
         }
         self.step_stats.append(step_stat)
 
-        # Add verification metrics to all_scores for logging
+        # Add verification metrics
         all_scores['verification_execution_count'] = [len(execution_indices)]
         all_scores['verification_llm_count'] = [len(llm_indices)]
         all_scores['verification_execution_fraction'] = [len(execution_indices) / n_valid if n_valid > 0 else 0.0]
@@ -625,62 +476,56 @@ class AdaptiveCodeIORewardManager(CodeIORewardManager):
 
         return reward_tensor, all_scores, [], correct_predictions
 
-    def _compute_uncertainties_batch(
+    def _get_reflection_votes_batch(
         self,
         data_dicts: List[Dict],
         problem_types: List[str],
         rollout_actor_wg,
-    ) -> List[float]:
+    ) -> Dict[int, Dict]:
         """
-        Compute uncertainties for all tasks using self-consistency.
+        Get N reflection votes for each task.
 
-        This uses the rollout actor to generate multiple responses and
-        computes the normalized entropy of the answer distribution.
+        For each valid task:
+        1. Construct reflection prompt: "Is [answer] correct for [task]?"
+        2. Generate N responses with temperature > 0
+        3. Extract CORRECT/INCORRECT votes from each response
+
+        Returns:
+            Dict mapping task index to {'votes': [bool, ...], 'responses': [...]}
         """
         from verl.utils.dataset.rl_dataset import collate_fn
         from verl.protocol import pad_dataproto_to_divisor, unpad_dataproto
         from absolute_zero_reasoner.utils.dataset.rl_dataset import RLHFDataset
-        from absolute_zero_reasoner.data_construction.constructor import get_code_problem_predictor_prompt
-        from absolute_zero_reasoner.data_construction.process_data import instruction_following
 
-        if self.n_samples_for_uq <= 1 or rollout_actor_wg is None:
-            # No UQ possible, return default uncertainty
-            return [0.5] * len(data_dicts)
+        if rollout_actor_wg is None:
+            return {}
 
-        # Prepare prompts for self-consistency sampling
-        # We need to re-generate solver responses with temperature > 0
-        uq_prompts_data = []
+        # Prepare reflection prompts for valid tasks
+        reflection_prompts = []
         valid_indices = []
 
         for i, data_dict in enumerate(data_dicts):
             if not data_dict['format_score']:
                 continue
 
-            # Construct solver prompt for this task
-            program = data_dict.get('program', '')
-            gold_input = data_dict.get('input', '')
-            gold_output = data_dict.get('output', '')
-
-            if problem_types[i].endswith('code_i'):
-                predictor_prompt = get_code_problem_predictor_prompt(
-                    problem_type='code_i',
-                    snippet=program,
-                    input_args=gold_input,
-                    output=gold_output,
-                )
-            elif problem_types[i].endswith('code_o'):
-                predictor_prompt = get_code_problem_predictor_prompt(
-                    problem_type='code_o',
-                    snippet=program,
-                    input_args=gold_input,
-                    output=gold_output,
-                )
-            else:
+            answer = data_dict.get('answer')
+            if answer is None:
                 continue
 
-            prompt = instruction_following.format(predictor_prompt)
+            prompt = self._construct_reflection_prompt(
+                data_dict=data_dict,
+                problem_type=problem_types[i],
+            )
 
-            uq_prompts_data.append({
+            # Debug: log first few prompts
+            if self._debug_log_count < 3:
+                print(f"[DEBUG Reflection Prompt {self._debug_log_count}]")
+                print(f"  problem_type: {problem_types[i]}")
+                print(f"  answer: {str(answer)[:100]}...")
+                print(f"  prompt preview: {prompt[:300]}...")
+                self._debug_log_count += 1
+
+            reflection_prompts.append({
                 'prompt': [{'role': 'user', 'content': prompt}],
                 'uid': data_dict['uid'],
                 'data_source': data_dict['data_source'],
@@ -689,20 +534,17 @@ class AdaptiveCodeIORewardManager(CodeIORewardManager):
             })
             valid_indices.append(i)
 
-        # Initialize all uncertainties to 0.5 (default)
-        uncertainties = [0.5] * len(data_dicts)
+        if not reflection_prompts:
+            return {}
 
-        if not uq_prompts_data:
-            return uncertainties
-
-        # Sample multiple responses
-        # Repeat the prompts n_samples times
-        uq_prompts_data_repeated = uq_prompts_data * self.n_samples_for_uq
+        # Repeat prompts N times for sampling
+        prompts_repeated = reflection_prompts * self.n_samples_for_uq
 
         try:
-            import os
-            temp_path = f'{self.output_path}/temp_uq.parquet'
-            pd.DataFrame(uq_prompts_data_repeated).to_parquet(temp_path)
+            start_time = time.time()
+
+            temp_path = f'{self.output_path}/temp_reflection.parquet'
+            pd.DataFrame(prompts_repeated).to_parquet(temp_path)
 
             temp_data = RLHFDataset(
                 parquet_files=temp_path,
@@ -732,7 +574,7 @@ class AdaptiveCodeIORewardManager(CodeIORewardManager):
                 'eos_token_id': self.tokenizer.eos_token_id,
                 'pad_token_id': self.tokenizer.pad_token_id,
                 'recompute_log_prob': False,
-                'do_sample': True,  # Enable sampling for diversity
+                'do_sample': True,  # Enable sampling for diversity in reflections
                 'validate': False,
             }
 
@@ -741,9 +583,12 @@ class AdaptiveCodeIORewardManager(CodeIORewardManager):
             output_gen_batch_padded = rollout_actor_wg.generate_sequences(gen_batch_padded)
             output_gen_batch = unpad_dataproto(output_gen_batch_padded, pad_size=pad_size)
 
-            # Extract answers and group by task
-            answers_by_task = {i: [] for i in valid_indices}
-            n_prompts = len(uq_prompts_data)
+            llm_time = (time.time() - start_time) * 1000
+            self.verification_stats["llm_time_ms"] += llm_time
+
+            # Extract votes and group by task
+            results = {i: {'votes': [], 'responses': []} for i in valid_indices}
+            n_prompts = len(reflection_prompts)
 
             for out_idx in range(len(output_gen_batch)):
                 # Map back to original task
@@ -755,67 +600,46 @@ class AdaptiveCodeIORewardManager(CodeIORewardManager):
                     skip_special_tokens=True
                 )
 
-                # Extract answer from response
-                extracted = extract_answer(response, self.reward_fn_extraction_type, boxed_retry=self.boxed_retry)
-                if problem_types[task_idx].endswith('code_i'):
-                    answer = self.extract_input_output(extracted, return_input=True, return_output=False)
-                else:
-                    answer = self.extract_input_output(extracted, return_input=False, return_output=True)
+                vote = self._extract_reflection_vote(response)
+                results[task_idx]['votes'].append(vote)
+                results[task_idx]['responses'].append(response)
 
-                answers_by_task[task_idx].append(str(answer) if answer else '')
+            # Debug: log first few results
+            debug_count = 0
+            for task_idx, result in results.items():
+                if debug_count < 2:
+                    votes = result['votes']
+                    print(f"[DEBUG Reflection Result] Task {task_idx}")
+                    print(f"  Votes: {votes} ({sum(votes)}/{len(votes)} CORRECT)")
+                    print(f"  Entropy: {self._compute_vote_entropy(votes):.3f}")
+                    print(f"  Sample response: {result['responses'][0][:150]}...")
+                    debug_count += 1
 
-            # Compute normalized entropy for each task
-            for task_idx, answers in answers_by_task.items():
-                if not answers:
-                    uncertainties[task_idx] = 1.0
-                    continue
-
-                # Compute normalized self-consistency entropy
-                entropy = self._compute_normalized_entropy(answers)
-                uncertainties[task_idx] = entropy
+            return results
 
         except Exception as e:
-            PrettyPrinter.print_colored(f"UQ sampling failed: {e}", "red")
-            # Fall back to default uncertainty
-            pass
+            PrettyPrinter.print_colored(f"Reflection sampling failed: {e}", "red")
+            import traceback
+            traceback.print_exc()
+            return {}
 
-        return uncertainties
-
-    def _compute_normalized_entropy(self, answers: List[str]) -> float:
-        """Compute normalized entropy of answer distribution."""
-        n = len(answers)
-        if n == 0:
-            return 1.0
-
-        # Count answer frequencies
-        counts = Counter(answers)
-
-        # Compute entropy
-        entropy = 0.0
-        for count in counts.values():
-            p = count / n
-            if p > 0:
-                entropy -= p * math.log2(p)
-
-        # Normalize by max entropy (log2(n))
-        max_entropy = math.log2(n) if n > 1 else 1.0
-        normalized_entropy = entropy / max_entropy if max_entropy > 0 else 0.0
-
-        return normalized_entropy
-
-    def _construct_verifier_prompt(
+    def _construct_reflection_prompt(
         self,
         data_dict: Dict,
         problem_type: str,
     ) -> str:
-        """Construct LLM verifier prompt for a prediction task."""
+        """
+        Construct reflection prompt asking if the solver's answer is correct.
+
+        The prompt shows the task and the solver's answer, then asks for verification.
+        """
         program = data_dict.get('program', '')
         answer = data_dict.get('answer', '')
         gold_output = data_dict.get('output', '')
         gold_input = data_dict.get('input', '')
 
         if problem_type.endswith('code_o'):
-            return f"""You are a code verification assistant. Determine if the predicted output is correct.
+            return f"""Given the following Python code and input, determine if the predicted output is correct.
 
 Code:
 ```python
@@ -823,14 +647,13 @@ Code:
 ```
 
 Input: {gold_input}
-Expected Output: {gold_output}
 Predicted Output: {answer}
 
-Is the predicted output correct? Consider that outputs may be formatted differently but represent the same value.
-Answer with only "CORRECT" or "INCORRECT"."""
+Think step by step about what the code does with this input, then answer:
+Is the predicted output correct? Answer with CORRECT or INCORRECT."""
 
         elif problem_type.endswith('code_i'):
-            return f"""You are a code verification assistant. Determine if the predicted input would produce the expected output.
+            return f"""Given the following Python code and expected output, determine if the predicted input would produce that output.
 
 Code:
 ```python
@@ -840,29 +663,69 @@ Code:
 Expected Output: {gold_output}
 Predicted Input: {answer}
 
-Would this input produce the expected output when run through the code?
-Answer with only "CORRECT" or "INCORRECT"."""
+Think step by step about what input would produce the expected output, then answer:
+Is the predicted input correct? Answer with CORRECT or INCORRECT."""
 
         return ""
 
-    def _extract_llm_verdict(self, response: str) -> bool:
-        """Extract verdict from LLM verifier response."""
+    def _extract_reflection_vote(self, response: str) -> bool:
+        """
+        Extract CORRECT/INCORRECT vote from reflection response.
+
+        Returns True for CORRECT, False for INCORRECT.
+        """
         response_upper = response.upper().strip()
 
-        # Check for explicit keywords
-        if "INCORRECT" in response_upper:
-            return False
-        if "CORRECT" in response_upper:
-            return True
+        # Check for explicit keywords (order matters - check negative first)
+        negative_patterns = [
+            "INCORRECT", "NOT CORRECT", "WRONG", "NOT RIGHT",
+            "FALSE", "NO,", "NO.", "NO ", "WOULDN'T", "WOULD NOT",
+        ]
+        positive_patterns = [
+            "CORRECT", "RIGHT", "TRUE", "YES,", "YES.", "YES ",
+            "WOULD PRODUCE", "MATCHES", "EQUAL",
+        ]
 
-        # Fallback checks
-        if response_upper.startswith("YES"):
-            return True
-        if response_upper.startswith("NO"):
-            return False
+        # Check negative patterns first
+        for pattern in negative_patterns:
+            if pattern in response_upper:
+                return False
+
+        # Then check positive patterns
+        for pattern in positive_patterns:
+            if pattern in response_upper:
+                return True
 
         # Default to incorrect if unclear
         return False
+
+    def _compute_vote_entropy(self, votes: List[bool]) -> float:
+        """
+        Compute normalized entropy of reflection votes.
+
+        For binary votes: H = -p*log2(p) - (1-p)*log2(1-p)
+        Normalized by max entropy (1.0 for binary)
+
+        Returns:
+            0.0 = all votes agree (low uncertainty)
+            1.0 = votes are split 50/50 (high uncertainty)
+        """
+        if not votes:
+            return 1.0
+
+        n = len(votes)
+        correct_count = sum(votes)
+
+        # Edge cases: all same vote
+        if correct_count == 0 or correct_count == n:
+            return 0.0
+
+        # Binary entropy
+        p = correct_count / n
+        entropy = -p * math.log2(p) - (1 - p) * math.log2(1 - p)
+
+        # Already normalized for binary (max entropy = 1.0)
+        return entropy
 
     def get_wandb_metrics(self) -> Dict:
         """Get metrics formatted for wandb logging."""
