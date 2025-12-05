@@ -546,6 +546,8 @@ class AdaptiveCodeIORewardManager(CodeIORewardManager):
         from absolute_zero_reasoner.utils.dataset.rl_dataset import RLHFDataset
 
         if rollout_actor_wg is None:
+            print("[DEBUG] rollout_actor_wg is None! Cannot generate reflections.")
+            print("  This is required for LLM-based verification.")
             return {}
 
         # Prepare reflection prompts for valid tasks

@@ -908,9 +908,10 @@ class CodeIORayPPOTrainer(ReasonRLRayPPOTrainer):
                 }
             elif problem_type.startswith('pred'):
                 reward_fn_kwargs = {
-                    'data': batch, 
-                    'problem_type': problem_type, 
+                    'data': batch,
+                    'problem_type': problem_type,
                     'executor': executor,
+                    'rollout_actor_wg': self.actor_rollout_wg,  # Needed for LLM-based verification
                 }
             with marked_timer(f'reward_fn/{problem_type}', timing_raw):
                 PrettyPrinter.status("REWARD", f"Computing rewards for {problem_type}...", "info")
