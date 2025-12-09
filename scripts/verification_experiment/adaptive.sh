@@ -4,6 +4,9 @@
 # High uncertainty -> execution, Low uncertainty -> LLM
 set -x
 
+# Seed for reproducibility (change this for different runs)
+SEED=${SEED:-42}
+
 export VLLM_ATTENTION_BACKEND=FLASH_ATTN
 export RAY_memory_monitor_refresh_ms=0
 export RAY_LOGGING_LEVEL=DEBUG
@@ -77,6 +80,7 @@ python -m absolute_zero_reasoner.main_azr_ppo \
     azr.verification_mode=adaptive \
     azr.verification_budget_fraction=${BUDGET_FRACTION} \
     azr.n_samples_for_uq=${N_SAMPLES_UQ} \
+    azr.seed=${SEED} \
     trainer.debug=False \
     azr.reward.generation_reward_config.complexity_reward.enabled=False \
     azr.reward.generation_reward_config.mean_edit_distance_reward.enabled=False \

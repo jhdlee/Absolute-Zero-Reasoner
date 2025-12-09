@@ -19,6 +19,7 @@ import os
 import time
 import math
 from typing import Dict, Any, List, Tuple, Optional
+import re
 from collections import defaultdict
 from enum import Enum
 import uuid
@@ -74,6 +75,7 @@ class AdaptiveCodeIORewardManager(CodeIORewardManager):
         llm_for_verification = None,
         budget_fraction: float = 0.3,
         n_samples_for_uq: int = 8,
+        debug_reflections: bool = True,
     ):
         """
         Args:
@@ -82,6 +84,7 @@ class AdaptiveCodeIORewardManager(CodeIORewardManager):
             llm_for_verification: Not used (kept for API compatibility)
             budget_fraction: Fraction of high-uncertainty tasks to verify with execution in adaptive mode
             n_samples_for_uq: Number of reflection samples for uncertainty quantification
+            debug_reflections: If True, print detailed reflection prompts and responses
         """
         super().__init__(
             tokenizer=tokenizer,
@@ -106,6 +109,7 @@ class AdaptiveCodeIORewardManager(CodeIORewardManager):
         self.llm_for_verification = llm_for_verification  # Kept for API compatibility
         self.budget_fraction = budget_fraction
         self.n_samples_for_uq = n_samples_for_uq
+        self.debug_reflections = debug_reflections
 
         # Tracking metrics
         self.verification_stats = {
@@ -296,20 +300,25 @@ class AdaptiveCodeIORewardManager(CodeIORewardManager):
                 reward_tensor[i, valid_response_length - 1] = -1.0
             elif i in reflection_results:
                 votes = reflection_results[i]['votes']
-                correct_count = sum(votes)
                 total_votes = len(votes)
 
-                # Majority voting
-                majority_correct = correct_count > total_votes / 2
-                acc_reward = 1.0 if majority_correct else 0.0
-
-                if self.split == 'train':
-                    reward_tensor[i, valid_response_length - 1] = acc_reward if acc_reward > 0 else -0.5
+                if total_votes == 0:
+                    # No valid votes (all reflections failed to produce boxed answer)
+                    acc_reward = 0.0
+                    reward_tensor[i, valid_response_length - 1] = -0.5
                 else:
-                    reward_tensor[i, valid_response_length - 1] = acc_reward
+                    correct_count = sum(votes)
+                    # Majority voting
+                    majority_correct = correct_count > total_votes / 2
+                    acc_reward = 1.0 if majority_correct else 0.0
 
-                if acc_reward > 0:
-                    correct_predictions.append(data_dict)
+                    if self.split == 'train':
+                        reward_tensor[i, valid_response_length - 1] = acc_reward if acc_reward > 0 else -0.5
+                    else:
+                        reward_tensor[i, valid_response_length - 1] = acc_reward
+
+                    if acc_reward > 0:
+                        correct_predictions.append(data_dict)
             else:
                 acc_reward = 0.0
                 reward_tensor[i, valid_response_length - 1] = -0.5
@@ -577,7 +586,7 @@ class AdaptiveCodeIORewardManager(CodeIORewardManager):
                 continue
 
             # Debug: log first few prompts
-            if self._debug_log_count < 3:
+            if self.debug_reflections and self._debug_log_count < 3:
                 print(f"[DEBUG Reflection Prompt {self._debug_log_count}]")
                 print(f"  problem_type: {problem_types[i]}")
                 print(f"  answer: {str(answer)[:100]}...")
@@ -670,19 +679,34 @@ class AdaptiveCodeIORewardManager(CodeIORewardManager):
                 )
 
                 vote = self._extract_reflection_vote(response)
-                results[task_idx]['votes'].append(vote)
-                results[task_idx]['responses'].append(response)
+                # Only count valid votes (not None)
+                if vote is not None:
+                    results[task_idx]['votes'].append(vote)
+                    results[task_idx]['responses'].append(response)
+                else:
+                    # Track invalid reflections for debugging
+                    if 'invalid_count' not in results[task_idx]:
+                        results[task_idx]['invalid_count'] = 0
+                    results[task_idx]['invalid_count'] += 1
 
-            # Debug: log first few results
-            debug_count = 0
-            for task_idx, result in results.items():
-                if debug_count < 2:
-                    votes = result['votes']
-                    print(f"[DEBUG Reflection Result] Task {task_idx}")
-                    print(f"  Votes: {votes} ({sum(votes)}/{len(votes)} CORRECT)")
-                    print(f"  Entropy: {self._compute_vote_entropy(votes):.3f}")
-                    print(f"  Sample response: {result['responses'][0][:150]}...")
-                    debug_count += 1
+            # Debug: log reflection results
+            if self.debug_reflections:
+                debug_count = 0
+                for task_idx, result in results.items():
+                    if debug_count < 5:  # Show first 5 tasks
+                        votes = result['votes']
+                        invalid_count = result.get('invalid_count', 0)
+                        print(f"\n[DEBUG Reflection Result] Task {task_idx}")
+                        print(f"  Valid votes: {len(votes)}, Invalid (no boxed answer): {invalid_count}")
+                        if votes:
+                            print(f"  Votes: {votes} ({sum(votes)}/{len(votes)} CORRECT)")
+                            print(f"  Entropy: {self._compute_vote_entropy(votes):.3f}")
+                        else:
+                            print("  No valid votes!")
+                        # Show all responses if debug_reflections is on
+                        for resp_idx, resp in enumerate(result['responses']):
+                            print(f"  Response {resp_idx}: {resp[:200]}...")
+                        debug_count += 1
 
             return results
 
@@ -721,8 +745,9 @@ Code:
 Input: {gold_input}
 Predicted Output: {answer}
 
-Think step by step about what the code does with this input, then answer:
-Is the predicted output correct? Answer with CORRECT or INCORRECT."""
+Think step by step about what the code does with this input.
+Then provide your final answer in a box using EXACTLY this format:
+\\boxed{{CORRECT}} or \\boxed{{INCORRECT}}"""
 
         elif problem_type.endswith('code_i'):
             return f"""Given the following Python code and expected output, determine if the predicted input would produce that output.
@@ -735,8 +760,9 @@ Code:
 Expected Output: {gold_output}
 Predicted Input: {answer}
 
-Think step by step about what input would produce the expected output, then answer:
-Is the predicted input correct? Answer with CORRECT or INCORRECT."""
+Think step by step about what input would produce the expected output.
+Then provide your final answer in a box using EXACTLY this format:
+\\boxed{{CORRECT}} or \\boxed{{INCORRECT}}"""
 
         elif problem_type.endswith('code_f'):
             # For pred_code_f: given_inputs/given_outputs are shown to the model
@@ -762,55 +788,47 @@ Predicted Function:
 Example Input/Output pairs:
 {io_str}
 
-Think step by step about whether the predicted function would produce the correct outputs for the given inputs, then answer:
-Is the predicted function correct? Answer with CORRECT or INCORRECT."""
+Think step by step about whether the predicted function would produce the correct outputs for the given inputs.
+Then provide your final answer in a box using EXACTLY this format:
+\\boxed{{CORRECT}} or \\boxed{{INCORRECT}}"""
 
         return ""
 
-    def _extract_reflection_vote(self, response: str) -> bool:
+    def _extract_reflection_vote(self, response: str) -> Optional[bool]:
         """
-        Extract CORRECT/INCORRECT vote from reflection response.
+        Extract CORRECT/INCORRECT vote from the boxed answer in reflection response.
 
-        Returns True for CORRECT, False for INCORRECT.
+        Returns:
+            True: if \\boxed{CORRECT} found
+            False: if \\boxed{INCORRECT} found
+            None: if no valid boxed answer found (invalid reflection)
         """
-        response_upper = response.upper().strip()
-
-        # Check for explicit keywords (order matters - check negative first)
-        negative_patterns = [
-            "INCORRECT", "NOT CORRECT", "WRONG", "NOT RIGHT",
-            "FALSE", "NO,", "NO.", "NO ", "WOULDN'T", "WOULD NOT",
-        ]
-        positive_patterns = [
-            "CORRECT", "RIGHT", "TRUE", "YES,", "YES.", "YES ",
-            "WOULD PRODUCE", "MATCHES", "EQUAL",
-        ]
+        # Look for boxed answer pattern: \boxed{CORRECT} or \boxed{INCORRECT}
+        # Handle various formats: \boxed{}, \\boxed{}, boxed{}
+        boxed_pattern = r'\\?\\?boxed\s*\{\s*(CORRECT|INCORRECT)\s*\}'
+        matches = re.findall(boxed_pattern, response, re.IGNORECASE)
 
         # Debug: log extraction for first few responses
-        if self._debug_vote_count < 10:
-            matched_neg = [p for p in negative_patterns if p in response_upper]
-            matched_pos = [p for p in positive_patterns if p in response_upper]
+        if self.debug_reflections and self._debug_vote_count < 10:
             print(f"[DEBUG VOTE EXTRACTION {self._debug_vote_count}]")
-            print(f"  Response (first 150 chars): {response[:150]}...")
-            print(f"  Matched negative: {matched_neg}")
-            print(f"  Matched positive: {matched_pos}")
+            print(f"  Response (last 300 chars): ...{response[-300:]}")
+            print(f"  Boxed matches found: {matches}")
             self._debug_vote_count += 1
 
-        # Check negative patterns first
-        for pattern in negative_patterns:
-            if pattern in response_upper:
+        if matches:
+            # Use the last boxed answer (final verdict)
+            final_answer = matches[-1].upper()
+            if final_answer == "CORRECT":
+                return True
+            elif final_answer == "INCORRECT":
                 return False
 
-        # Then check positive patterns
-        for pattern in positive_patterns:
-            if pattern in response_upper:
-                return True
-
-        # Default to incorrect if unclear
-        if self._debug_vote_count < 15:
-            print(f"  -> Defaulting to INCORRECT (no patterns matched)")
+        # No valid boxed answer found
+        if self.debug_reflections and self._debug_vote_count < 15:
+            print(f"  -> No valid boxed answer found, skipping this reflection")
             self._debug_vote_count += 1
 
-        return False
+        return None
 
     def _compute_vote_entropy(self, votes: List[bool]) -> float:
         """

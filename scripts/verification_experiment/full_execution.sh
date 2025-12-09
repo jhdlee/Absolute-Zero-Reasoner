@@ -3,6 +3,9 @@
 # Uses Python executor for all verification (ground truth)
 set -x
 
+# Seed for reproducibility (change this for different runs)
+SEED=${SEED:-42}
+
 export VLLM_ATTENTION_BACKEND=FLASH_ATTN
 export RAY_memory_monitor_refresh_ms=0
 export RAY_LOGGING_LEVEL=DEBUG
@@ -70,6 +73,7 @@ python -m absolute_zero_reasoner.main_azr_ppo \
     azr.reward.n_samples=8 \
     azr.problem_types=['code_i','code_o','code_f'] \
     azr.verification_mode=full_execution \
+    azr.seed=${SEED} \
     trainer.debug=False \
     azr.reward.generation_reward_config.complexity_reward.enabled=False \
     azr.reward.generation_reward_config.mean_edit_distance_reward.enabled=False \

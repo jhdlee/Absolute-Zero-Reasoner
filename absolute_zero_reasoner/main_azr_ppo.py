@@ -14,12 +14,33 @@
 """
 Note that we don't combine the main with ray_trainer as ray_trainer is used by other main.
 """
+import os
+import random
 import ray
 import hydra
+import numpy as np
+import torch
 from pathlib import Path
 from pprint import pprint
 
 from omegaconf import OmegaConf
+
+
+def seed_everything(seed: int):
+    """Set all random seeds for reproducibility."""
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+    # For reproducibility with CUDA operations (may slow down training)
+    # torch.backends.cudnn.deterministic = True
+    # torch.backends.cudnn.benchmark = False
+    os.environ['PYTHONHASHSEED'] = str(seed)
+    print(f"[SEED] All random seeds set to {seed}")
+
+
 from verl.utils.fs import copy_local_path_from_hdfs
 from verl.utils import hf_tokenizer
 from verl.trainer.ppo.ray_trainer import ResourcePoolManager, Role
@@ -68,6 +89,10 @@ class TaskRunner:
     def run(self, config):
         pprint(OmegaConf.to_container(config, resolve=True))  # resolve=True will eval symbol values
         OmegaConf.resolve(config)
+
+        # Set random seeds for reproducibility
+        seed = OmegaConf.select(config.azr, "seed", default=42)
+        seed_everything(seed)
 
         if config.trainer.debug:
             import debugpy
@@ -194,6 +219,7 @@ class TaskRunner:
                 llm_for_verification=None,  # Will use rollout_actor_wg passed in __call__
                 budget_fraction=OmegaConf.select(config.azr, "verification_budget_fraction", default=0.3),
                 n_samples_for_uq=OmegaConf.select(config.azr, "n_samples_for_uq", default=8),
+                debug_reflections=OmegaConf.select(config.azr, "debug_reflections", default=True),
             )
         else:
             reward_fn = CodeIORewardManager(

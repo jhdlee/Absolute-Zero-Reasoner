@@ -492,6 +492,7 @@ azr:
   verification_mode: "full_execution"  # [full_execution, full_llm, adaptive]
   verification_budget_fraction: 0.3  # For adaptive mode: fraction of high-uncertainty tasks using execution
   n_samples_for_uq: 8  # For adaptive mode: number of samples for uncertainty quantification
+  debug_reflections: True  # If True, print detailed reflection prompts and responses
   past_epoch_window: ${azr.data_selection_strategy.update_iteration}
   seed_dataset: null
   error_seed_dataset: null
