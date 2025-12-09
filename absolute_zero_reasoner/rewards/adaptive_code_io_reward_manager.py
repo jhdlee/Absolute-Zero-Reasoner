@@ -538,14 +538,19 @@ class AdaptiveCodeIORewardManager(CodeIORewardManager):
         data_dicts: List[Dict],
         problem_types: List[str],
         rollout_actor_wg,
+        max_retries: int = 4,
     ) -> Dict[int, Dict]:
         """
-        Get N reflection votes for each task.
+        Get N reflection votes for each task, retrying for invalid reflections.
 
         For each valid task:
         1. Construct reflection prompt: "Is [answer] correct for [task]?"
-        2. Generate N responses with temperature > 0
+        2. Generate responses with temperature > 0
         3. Extract CORRECT/INCORRECT votes from each response
+        4. Retry for tasks that don't have enough valid votes
+
+        Args:
+            max_retries: Maximum number of retry rounds for invalid reflections
 
         Returns:
             Dict mapping task index to {'votes': [bool, ...], 'responses': [...]}
@@ -562,6 +567,7 @@ class AdaptiveCodeIORewardManager(CodeIORewardManager):
         # Prepare reflection prompts for valid tasks
         reflection_prompts = []
         valid_indices = []
+        prompt_to_index = {}  # Map prompt position to task index
         skipped_format = 0
         skipped_answer = 0
 
@@ -593,12 +599,14 @@ class AdaptiveCodeIORewardManager(CodeIORewardManager):
                 print(f"  prompt preview: {prompt[:300]}...")
                 self._debug_log_count += 1
 
+            prompt_to_index[len(reflection_prompts)] = i
             reflection_prompts.append({
                 'prompt': [{'role': 'user', 'content': prompt}],
                 'uid': data_dict['uid'],
                 'data_source': data_dict['data_source'],
                 'extra_info': data_dict['extra_info'],
                 'ground_truth': '',
+                'task_index': i,  # Store original task index
             })
             valid_indices.append(i)
 
@@ -608,116 +616,168 @@ class AdaptiveCodeIORewardManager(CodeIORewardManager):
             print(f"  Skipped due to answer=None: {skipped_answer}")
             return {}
 
-        # Repeat prompts N times for sampling
-        prompts_repeated = reflection_prompts * self.n_samples_for_uq
+        # Initialize results
+        results = {i: {'votes': [], 'responses': [], 'invalid_count': 0} for i in valid_indices}
+
+        # Track how many more valid votes each task needs
+        votes_needed = {i: self.n_samples_for_uq for i in valid_indices}
 
         print(f"\n[DEBUG REFLECTION GENERATION]")
         print(f"  Total tasks: {len(data_dicts)}")
         print(f"  Skipped (format_score=False): {skipped_format}")
         print(f"  Skipped (answer=None): {skipped_answer}")
         print(f"  Valid tasks for reflection: {len(reflection_prompts)}")
-        print(f"  Total prompts (N={self.n_samples_for_uq} samples): {len(prompts_repeated)}")
+        print(f"  Target votes per task: {self.n_samples_for_uq}")
 
-        try:
-            start_time = time.time()
+        retry_round = 0
+        total_generated = 0
 
-            temp_path = f'{self.output_path}/temp_reflection.parquet'
-            pd.DataFrame(prompts_repeated).to_parquet(temp_path)
+        while retry_round <= max_retries:
+            # Determine which tasks need more votes and how many
+            tasks_needing_votes = [(i, votes_needed[i]) for i in valid_indices if votes_needed[i] > 0]
 
-            temp_data = RLHFDataset(
-                parquet_files=temp_path,
-                tokenizer=self.tokenizer,
-                prompt_key='prompt',
-                max_prompt_length=self.max_prompt_length,
-                filter_prompts=True,
-                return_raw_chat=False,
-                truncation='error'
-            )
-            os.remove(temp_path)
+            if not tasks_needing_votes:
+                print(f"  All tasks have {self.n_samples_for_uq} valid votes!")
+                break
 
-            sampler = torch.utils.data.SequentialSampler(data_source=temp_data)
-            dataloader = torch.utils.data.DataLoader(
-                dataset=temp_data,
-                batch_size=len(temp_data),
-                drop_last=False,
-                shuffle=False,
-                collate_fn=collate_fn,
-                sampler=sampler,
-            )
+            if retry_round > 0:
+                print(f"\n[DEBUG RETRY ROUND {retry_round}]")
+                print(f"  Tasks still needing votes: {len(tasks_needing_votes)}")
+                for task_idx, needed in tasks_needing_votes[:5]:
+                    print(f"    Task {task_idx}: needs {needed} more votes")
 
-            batch_data = next(iter(dataloader))
-            gen_batch = DataProto.from_single_dict(batch_data)
-            gen_batch = gen_batch.pop(['input_ids', 'attention_mask', 'position_ids'])
-            gen_batch.meta_info = {
-                'eos_token_id': self.tokenizer.eos_token_id,
-                'pad_token_id': self.tokenizer.pad_token_id,
-                'recompute_log_prob': False,
-                'do_sample': True,  # Enable sampling for diversity in reflections
-                'validate': False,
-            }
+            # Build prompts for this round
+            prompts_this_round = []
+            prompt_task_mapping = []  # Track which task each prompt belongs to
 
-            # Generate
-            gen_batch_padded, pad_size = pad_dataproto_to_divisor(gen_batch, rollout_actor_wg.world_size)
-            output_gen_batch_padded = rollout_actor_wg.generate_sequences(gen_batch_padded)
-            output_gen_batch = unpad_dataproto(output_gen_batch_padded, pad_size=pad_size)
+            for task_idx, needed in tasks_needing_votes:
+                # Find the prompt for this task
+                prompt_pos = [p for p, idx in prompt_to_index.items() if idx == task_idx][0]
+                prompt_data = reflection_prompts[prompt_pos]
 
-            llm_time = (time.time() - start_time) * 1000
-            self.verification_stats["llm_time_ms"] += llm_time
+                # Add prompt `needed` times
+                for _ in range(needed):
+                    prompts_this_round.append(prompt_data)
+                    prompt_task_mapping.append(task_idx)
 
-            # Extract votes and group by task
-            results = {i: {'votes': [], 'responses': []} for i in valid_indices}
-            n_prompts = len(reflection_prompts)
+            if not prompts_this_round:
+                break
 
-            for out_idx in range(len(output_gen_batch)):
-                # Map back to original task
-                task_pos = out_idx % n_prompts
-                task_idx = valid_indices[task_pos]
+            print(f"  Generating {len(prompts_this_round)} reflections...")
+            total_generated += len(prompts_this_round)
 
-                response = self.tokenizer.decode(
-                    output_gen_batch[out_idx].batch['responses'],
-                    skip_special_tokens=True
+            try:
+                start_time = time.time()
+
+                temp_path = f'{self.output_path}/temp_reflection_{retry_round}.parquet'
+                pd.DataFrame(prompts_this_round).to_parquet(temp_path)
+
+                temp_data = RLHFDataset(
+                    parquet_files=temp_path,
+                    tokenizer=self.tokenizer,
+                    prompt_key='prompt',
+                    max_prompt_length=self.max_prompt_length,
+                    filter_prompts=True,
+                    return_raw_chat=False,
+                    truncation='error'
+                )
+                os.remove(temp_path)
+
+                sampler = torch.utils.data.SequentialSampler(data_source=temp_data)
+                dataloader = torch.utils.data.DataLoader(
+                    dataset=temp_data,
+                    batch_size=len(temp_data),
+                    drop_last=False,
+                    shuffle=False,
+                    collate_fn=collate_fn,
+                    sampler=sampler,
                 )
 
-                vote = self._extract_reflection_vote(response)
-                # Only count valid votes (not None)
-                if vote is not None:
-                    results[task_idx]['votes'].append(vote)
-                    results[task_idx]['responses'].append(response)
-                else:
-                    # Track invalid reflections for debugging
-                    if 'invalid_count' not in results[task_idx]:
-                        results[task_idx]['invalid_count'] = 0
-                    results[task_idx]['invalid_count'] += 1
+                batch_data = next(iter(dataloader))
+                gen_batch = DataProto.from_single_dict(batch_data)
+                gen_batch = gen_batch.pop(['input_ids', 'attention_mask', 'position_ids'])
+                gen_batch.meta_info = {
+                    'eos_token_id': self.tokenizer.eos_token_id,
+                    'pad_token_id': self.tokenizer.pad_token_id,
+                    'recompute_log_prob': False,
+                    'do_sample': True,  # Enable sampling for diversity in reflections
+                    'validate': False,
+                }
 
-            # Debug: log reflection results
-            if self.debug_reflections:
-                debug_count = 0
-                for task_idx, result in results.items():
-                    if debug_count < 5:  # Show first 5 tasks
-                        votes = result['votes']
-                        invalid_count = result.get('invalid_count', 0)
-                        print(f"\n[DEBUG Reflection Result] Task {task_idx}")
-                        print(f"  Valid votes: {len(votes)}, Invalid (no boxed answer): {invalid_count}")
-                        if votes:
-                            print(f"  Votes: {votes} ({sum(votes)}/{len(votes)} CORRECT)")
-                            print(f"  Entropy: {self._compute_vote_entropy(votes):.3f}")
-                        else:
-                            print("  No valid votes!")
-                        # Show all responses if debug_reflections is on
-                        for resp_idx, resp in enumerate(result['responses']):
-                            print(f"  Response {resp_idx}: {resp[:200]}...")
-                        debug_count += 1
+                # Generate
+                gen_batch_padded, pad_size = pad_dataproto_to_divisor(gen_batch, rollout_actor_wg.world_size)
+                output_gen_batch_padded = rollout_actor_wg.generate_sequences(gen_batch_padded)
+                output_gen_batch = unpad_dataproto(output_gen_batch_padded, pad_size=pad_size)
 
-            return results
+                llm_time = (time.time() - start_time) * 1000
+                self.verification_stats["llm_time_ms"] += llm_time
 
-        except Exception as e:
-            print(f"\n[DEBUG ERROR] Reflection sampling failed!")
-            print(f"  Exception type: {type(e).__name__}")
-            print(f"  Exception message: {e}")
-            PrettyPrinter.status("ERROR", f"Reflection sampling failed: {e}", "error")
-            import traceback
-            traceback.print_exc()
-            return {}
+                # Extract votes
+                for out_idx in range(len(output_gen_batch)):
+                    task_idx = prompt_task_mapping[out_idx]
+
+                    # Skip if we already have enough votes for this task
+                    if votes_needed[task_idx] <= 0:
+                        continue
+
+                    response = self.tokenizer.decode(
+                        output_gen_batch[out_idx].batch['responses'],
+                        skip_special_tokens=True
+                    )
+
+                    vote = self._extract_reflection_vote(response)
+                    if vote is not None:
+                        results[task_idx]['votes'].append(vote)
+                        results[task_idx]['responses'].append(response)
+                        votes_needed[task_idx] -= 1
+                    else:
+                        results[task_idx]['invalid_count'] += 1
+
+            except Exception as e:
+                print(f"\n[DEBUG ERROR] Reflection sampling failed in round {retry_round}!")
+                print(f"  Exception type: {type(e).__name__}")
+                print(f"  Exception message: {e}")
+                PrettyPrinter.status("ERROR", f"Reflection sampling failed: {e}", "error")
+                import traceback
+                traceback.print_exc()
+                break
+
+            retry_round += 1
+
+        # Final summary
+        tasks_with_full_votes = sum(1 for i in valid_indices if len(results[i]['votes']) >= self.n_samples_for_uq)
+        tasks_with_partial_votes = sum(1 for i in valid_indices if 0 < len(results[i]['votes']) < self.n_samples_for_uq)
+        tasks_with_no_votes = sum(1 for i in valid_indices if len(results[i]['votes']) == 0)
+        total_invalid = sum(results[i]['invalid_count'] for i in valid_indices)
+
+        print("\n[DEBUG REFLECTION SUMMARY]")
+        print(f"  Total reflections generated: {total_generated}")
+        print(f"  Total invalid (no boxed answer): {total_invalid}")
+        print(f"  Tasks with full votes ({self.n_samples_for_uq}): {tasks_with_full_votes}")
+        print(f"  Tasks with partial votes: {tasks_with_partial_votes}")
+        print(f"  Tasks with no valid votes: {tasks_with_no_votes}")
+        print(f"  Retry rounds used: {retry_round}")
+
+        # Debug: log reflection results
+        if self.debug_reflections:
+            debug_count = 0
+            for task_idx, result in results.items():
+                if debug_count < 5:  # Show first 5 tasks
+                    votes = result['votes']
+                    invalid_count = result.get('invalid_count', 0)
+                    print(f"\n[DEBUG Reflection Result] Task {task_idx}")
+                    print(f"  Valid votes: {len(votes)}/{self.n_samples_for_uq}, Invalid: {invalid_count}")
+                    if votes:
+                        print(f"  Votes: {votes} ({sum(votes)}/{len(votes)} CORRECT)")
+                        print(f"  Entropy: {self._compute_vote_entropy(votes):.3f}")
+                    else:
+                        print("  No valid votes!")
+                    # Show all responses if debug_reflections is on
+                    for resp_idx, resp in enumerate(result['responses']):
+                        print(f"  Response {resp_idx}: {resp[:200]}...")
+                    debug_count += 1
+
+        return results
 
     def _construct_reflection_prompt(
         self,
